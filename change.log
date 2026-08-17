@@ -1,0 +1,215 @@
+# change.log — feat/airgap-bulk-push（空气隔离摆渡 / 批量入库 CLI）
+
+日期：2026-08-17  
+分支：`feat/airgap-bulk-push`  
+说明：本文件记录本次在 CLI 侧实现的功能、用法与对应代码位置。服务端解压合并尚未实现；压缩包在客户端**只整包上传、不解压**。
+
+---
+
+## 1. 目录递归上传 + skip-dupe
+
+### 功能
+- `ak artifact push <repo> --from-dir <DIR>`：递归扫目录，按相对路径上传。
+- `--skip-dupe-uploads`：拉取仓库制品索引，按路径 + SHA-256 跳过已存在且相同的文件。
+- 普通目录走 generic artifact PUT；若目录是 Go proxy 缓存布局则走第 2 节协议（见下）。
+
+### 用法
+```bash
+ak artifact push my-repo --from-dir ./mirror --skip-dupe-uploads
+```
+
+### 代码位置
+| 内容 | 路径 |
+|------|------|
+| CLI 参数 `Push { from_dir, skip_dupe_uploads, … }` | `src/commands/artifact.rs`（`ArtifactCommand::Push`） |
+| 调度入口 `push()` / `push_items()` | `src/commands/artifact.rs` |
+| 递归收集 `collect_upload_items` / `collect_dir_files` | `src/commands/artifact.rs` |
+| 远端校验和索引 `fetch_remote_checksum_index` | `src/commands/artifact.rs` |
+| 帮助示例 | `src/cli.rs`（`Command::Artifact` after_help） |
+| README 示例 | `README.md`（Quick Start） |
+| 解析/收集单测 | `src/commands/artifact.rs` `mod tests`（`parse_push_from_dir_*`、`collect_dir_*`） |
+
+---
+
+## 2. Go 协议多模块目录上传
+
+### 功能
+- 检测 Go module proxy / download cache 布局：`<module>/@v/<version>.zip` + 同名 `.mod`。
+- 通过 Go 协议上传：`PUT /go/{repo}/{module}/@v/{version}.{zip,mod}`（不是 generic `/api/v1/.../artifacts/...`）。
+- `--skip-dupe-uploads`：对 `.mod` 做 `HEAD`，版本已存在则跳过。
+- 路径中的 Go `!` 大小写编码在 URL 中原样保留；展示时解码。
+
+### 用法
+```bash
+ak artifact push go-local --from-dir ./gomodcache/cache/download --skip-dupe-uploads
+```
+
+### 代码位置
+| 内容 | 路径 |
+|------|------|
+| 扫描 / 检测 / URL / PUT / HEAD / 批量推送 | `src/commands/go_proxy.rs` |
+| · `looks_like_go_proxy_cache` / `scan_go_proxy_cache` | 同上 |
+| · `decode_go_path` / `go_module_url` | 同上 |
+| · `go_version_exists` / `push_go_module` / `push_go_proxy_cache` | 同上 |
+| 在 `push()` 中自动分流到 Go 协议 | `src/commands/artifact.rs`（`from_dir` + `looks_like_go_proxy_cache` 分支） |
+| 模块注册 | `src/commands/mod.rs`（`pub mod go_proxy`） |
+| 单测 | `src/commands/go_proxy.rs` `mod tests` |
+
+---
+
+## 3. 压缩包整包上传（客户端不解压）
+
+### 功能
+- `ak artifact push <repo> --from-archive <FILE>`：把 zip/包作为**单个 blob**上传。
+- 默认路径：`ak-ferry/<文件名>`；可用 `--path` 覆盖。
+- 与 `--from-dir` 互斥；不要求再带 `files` 参数。
+- **故意不在 CLI 解压**，减少网络 IO；服务端扫包 / 合并 / skip-dupe 为后续工作。
+
+### 用法
+```bash
+ak artifact push go-local --from-archive ./ak-ferry-go.zip
+ak artifact push go-local --from-archive ./pack.zip --path ferry/inbound/pack.zip
+```
+
+### 代码位置
+| 内容 | 路径 |
+|------|------|
+| 参数 `--from-archive` | `src/commands/artifact.rs`（`ArtifactCommand::Push`） |
+| 整包上传分支（构造 `UploadItem` → `push_items`） | `src/commands/artifact.rs`（`push()` 开头） |
+| 解析单测 | `src/commands/artifact.rs`（`parse_push_from_archive_without_files`） |
+| 帮助 / README | `src/cli.rs`、`README.md` |
+
+> 已删除早期错误方向的客户端解压模块 `archive_ingest.rs`（不再存在）。
+
+---
+
+## 4. `ak download`：工具链隔离下载 + 索引 + 打 zip
+
+### 功能
+- 顶层命令：`ak download --go|--npm|--pypi|--cargo <input> …` **或** `ak download [--config download.config]`。
+- **推荐**用 TOML `download.config` 描述多语言/多任务。
+- 输入：模块列表文件，或 `go.mod` / `package.json` / `requirements.txt` / `Cargo.toml`。
+- **每个 root 模块隔离下载**（独立临时工程），避免多模块共处同一 lock 导致依赖版本被抬升。
+- `--all-versions`：忽略输入里的版本约束，对每个 **root 包名** 拉取 registry 上全部已发布版本。
+  - npm：`npm view` + `npm pack`（**仅 root tarball**）。
+  - go：`go list -m -versions` + 隔离 `go get`（依赖进共享 GOMODCACHE）。
+  - pypi：`pip index versions` + `pip download --no-deps`（仅 root 发行包）。
+  - cargo：sparse index 列版本 + 直下 `.crate`（仅 root crate）。
+- `--target` / `--node`：
+  - npm：平台（`linux-x64`…）× Node ABI。
+  - pypi：pip `--platform`（如 `manylinux2014_x86_64`）× Python 版本（`--node 3.11`）。
+  - go / cargo：忽略。
+- 每个 root 隔离下载；工具链缓存只写在 job work 目录（`GOMODCACHE` / `npm --cache` / `PIP_CACHE_DIR` / `CARGO_HOME`），不污染用户全局缓存。
+- zip 写入成功后**删除**该 job 的 work 树（payload + 工具链缓存 + isolate）。
+- SQLite ferry 跳过缓存（`blobs/`）仍保留，便于下次 skip；与工具链全局缓存无关。
+- **Server catalog**（跳过内网已有模块）：
+  - 内网：`ak download catalog <repo> -o ak-catalog.jsonl`（可选 `--include-artifacts`、`--ecosystem npm`）
+  - 外网：`ak download --npm … --catalog ak-catalog.jsonl`（或 `download.config` 顶层 `catalog = "…"`）
+  - 按 `ecosystem + name + version` 比对；已在 catalog 中的包不写入 ferry zip（`--force` 可忽略）
+
+### `download.config`（TOML）
+
+见仓库根目录 `download.config.example`。要点：
+
+| 字段 | 说明 |
+|------|------|
+| `work_dir` / `output_dir` | 全局工作目录 / 输出目录 |
+| `[[downloads]]` | 多任务；每项一个 ecosystem |
+| `ecosystem` | `npm` / `go` / `pypi` / `cargo` |
+| `input` | 相对配置文件目录的列表或 lockfile |
+| `output` | 该任务的 zip 路径 |
+| `all_versions` | 是否拉全版本 |
+| `targets` | npm 平台 / pypi pip platform |
+| `nodes` | npm Node / pypi Python 版本 |
+| `proxy` / `sumdb` | 仅 go |
+| `registry` | npm / pypi / cargo |
+| `options` | 预留的 ecosystem 扩展表 |
+
+也可单任务简写（无 `[[downloads]]`）：顶层写 `ecosystem` + `input`。
+
+不带 ecosystem 旗标时默认读当前目录 `download.config`。
+
+`--force` 忽略 SQLite 缓存强制重下；`--cache-db` / 配置 `cache_db` 指定库路径（默认在 AK config 目录下 `ferry-cache/downloads.sqlite`，旁路 `blobs/`）。
+
+`-j` / `--jobs` / 配置顶层 `jobs`：并发隔离拉取（默认 CPU 核数，上限 16）。
+单包失败会跳过并继续，结束时汇总；成功的包仍写入 ferry zip。
+
+### 多语言复用（`engine`）
+共用编排在 `src/commands/download/engine.rs`：
+- trait `LanguageToolchain`：各语言只实现解析 / 工具链探测 / `expand_passes` / 单 pass 拉取 / 缓存恢复
+- `run_ferry`：展开版本 → 并发 soft-fail 拉取 → 写 manifest → zip → 错误汇总
+- **go / npm / pypi / cargo** 均已接入（矩阵与 all-versions 经 `RootPass.context`）
+
+### 用法
+```bash
+ak download --go go.mod -o ak-ferry-go.zip
+ak download --npm package.json -o ak-ferry-npm.zip
+ak download --pypi requirements.txt -o ak-ferry-pypi.zip
+ak download --cargo Cargo.toml -o ak-ferry-cargo.zip
+ak download --pypi requirements.txt --target manylinux2014_x86_64 --node 3.12
+ak download --config download.config
+ak download   # 等价于读 ./download.config
+```
+
+### 代码位置
+| 内容 | 路径 |
+|------|------|
+| 顶层命令注册 `Command::Download` | `src/cli.rs` |
+| 参数 / 调度 / config 计划执行 | `src/commands/download/mod.rs` |
+| 共享编排 `LanguageToolchain` / `run_ferry` | `src/commands/download/engine.rs` |
+| `download.config` 解析 | `src/commands/download/config.rs` |
+| SQLite 下载缓存 | `src/commands/download/cache.rs` |
+| Go | `src/commands/download/go.rs` |
+| npm | `src/commands/download/npm.rs` |
+| pypi（`pip download`） | `src/commands/download/pypi.rs` |
+| cargo（`cargo fetch` / `.crate`） | `src/commands/download/cargo.rs` |
+| Manifest / zip | `manifest.rs` / `pack.rs` |
+| 示例配置 | `download.config.example` |
+
+### Ferry zip 布局（约定）
+```
+ak-ferry.json
+ak-ferry.jsonl
+download/…              # Go proxy cache（--go）
+npm/<pkg>/….tgz         # npm tarball（--npm）
+pypi/<pkg>/….whl|tar.gz # PyPI dists（--pypi）
+cargo/<crate>/….crate   # crates.io（--cargo）
+```
+
+---
+
+## 5. 依赖与文档改动
+
+| 内容 | 路径 |
+|------|------|
+| 新增依赖 `zip`（打 ferry 包） | `Cargo.toml` / `Cargo.lock` |
+| Quick Start 示例更新 | `README.md` |
+
+---
+
+## 6. 后续（服务端，未做）
+
+1. 接收 `--from-archive` 上传的 ferry zip，服务端解压。
+2. 按 `ak-ferry.json` / `jsonl` 与仓库索引 diff，**skip dupe uploads**，只入库缺失。
+3. Go 内容走 Go 协议入库；npm 等内容走对应协议或 generic。
+4. （可选）与 #2463 / #2464 bundle / 幂等导入语义对齐。
+
+---
+
+## 7. 文件清单（本次）
+
+### 新增
+- `src/commands/go_proxy.rs`
+- `src/commands/download/mod.rs`
+- `src/commands/download/go.rs`
+- `src/commands/download/npm.rs`
+- `src/commands/download/manifest.rs`
+- `src/commands/download/pack.rs`
+- `change.log`（本文件）
+
+### 修改
+- `src/commands/artifact.rs`
+- `src/commands/mod.rs`
+- `src/cli.rs`
+- `Cargo.toml` / `Cargo.lock`
+- `README.md`

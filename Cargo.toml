@@ -30,7 +30,7 @@ clap_mangen = "0.2"
 tokio = { version = "1", features = ["full"] }
 
 # HTTP client (must match progenitor-client's reqwest version)
-reqwest = { version = "0.13", features = ["json", "stream", "multipart"] }
+reqwest = { version = "0.13", features = ["json", "stream", "multipart", "blocking"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -72,6 +72,8 @@ glob = "0.3"
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
 tempfile = "3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 assert_cmd = "2"

@@ -1,0 +1,56 @@
+# Example air-gap ferry download plan
+# Usage: ak download --config download.config.example
+#    or: copy to ./download.config and run `ak download`
+#
+# Intranet → internet workflow:
+#   1) ak download catalog npm-local -o ak-catalog.jsonl
+#   2) copy ak-catalog.jsonl to the internet host
+#   3) ak download --npm package.json --catalog ak-catalog.jsonl
+
+work_dir = "./.ak-ferry-work"
+output_dir = "."
+cache_db = "./.ak-ferry-work/downloads.sqlite"
+# catalog = "./ak-catalog.jsonl"
+force = false
+# jobs = 8
+
+[[downloads]]
+ecosystem = "npm"
+input = "package.json"
+output = "ak-ferry-npm.zip"
+all_versions = false
+# Platform matrix (optional/native deps). Omit to use host OS/CPU only.
+targets = ["linux-x64", "darwin-arm64", "win32-x64"]
+# Node ABI matrix (prebuild / node-gyp target). Omit to use host Node only.
+# Combined with targets: each OS × each Node version.
+nodes = ["18", "20"]
+# npm registry (config → env npm_config_registry → npmmirror default)
+registry = "https://registry.npmmirror.com"
+
+[[downloads]]
+ecosystem = "go"
+input = "go.mod"
+output = "ak-ferry-go.zip"
+all_versions = false
+# Go module proxy / sumdb (config → env GOPROXY/GOSUMDB → China defaults)
+proxy = "https://goproxy.cn,direct"
+sumdb = "sum.golang.google.cn"
+
+[[downloads]]
+ecosystem = "pypi"
+input = "requirements.txt"
+output = "ak-ferry-pypi.zip"
+all_versions = false
+# pip --platform tags (optional). Combined with nodes as Python versions.
+# targets = ["manylinux2014_x86_64", "win_amd64", "macosx_11_0_arm64"]
+# nodes = ["3.11", "3.12"]
+# pip --index-url (config → env PIP_INDEX_URL → Tuna default)
+registry = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+[[downloads]]
+ecosystem = "cargo"
+input = "Cargo.toml"
+output = "ak-ferry-cargo.zip"
+all_versions = false
+# sparse crates.io index (config → env / Tuna default)
+registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"

@@ -93,6 +93,37 @@ ak repo list
 # 4. Upload an artifact
 ak artifact push my-repo ./package-1.0.tar.gz
 
+# Or recursively upload a directory tree (skip unchanged dupes)
+ak artifact push my-repo --from-dir ./mirror --skip-dupe-uploads
+
+# Go module proxy cache → Go protocol (not generic artifact PUT)
+ak artifact push go-local --from-dir ./gomodcache/cache/download --skip-dupe-uploads
+
+# Upload a ferry zip as one blob (server-side unpack/ingest comes later)
+ak artifact push go-local --from-archive ./ak-ferry-go.zip
+
+# Build a ferry zip online (isolated per root; uses go / npm / pip / cargo)
+ak download --go go.mod -o ak-ferry-go.zip
+ak download --npm package.json -o ak-ferry-npm.zip
+ak download --pypi requirements.txt -o ak-ferry-pypi.zip
+ak download --cargo Cargo.toml -o ak-ferry-cargo.zip
+
+# Skip packages already on the intranet server (copy catalog from intranet first):
+#   ak download catalog npm-local -o ak-catalog.jsonl
+ak download --npm package.json --catalog ak-catalog.jsonl -o ak-ferry-npm.zip
+ak download --npm package.json --all-versions -o ak-ferry-npm-all.zip
+ak download --npm package.json --target linux-x64 --target darwin-arm64 --target win32-x64
+ak download --npm package.json --target linux-x64 --node 18 --node 20
+ak download --pypi requirements.txt --target manylinux2014_x86_64 --node 3.12
+
+# Multi-ecosystem plan (TOML) — set proxy/registry per job for faster mirrors
+ak download --config download.config
+# or copy download.config.example → download.config and run:
+ak download
+
+# Re-download everything ignoring SQLite cache
+ak download --npm package.json --force
+
 # 5. Download an artifact
 ak artifact pull my-repo org/pkg/1.0/pkg-1.0.jar
 

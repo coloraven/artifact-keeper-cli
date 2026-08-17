@@ -23,8 +23,26 @@ pub enum ArtifactCommand {
         repo: String,
 
         /// File(s) to upload (supports glob patterns)
-        #[arg(required = true)]
+        #[arg(
+            required_unless_present_any = ["from_dir", "from_archive"],
+            num_args = 1..
+        )]
         files: Vec<String>,
+
+        /// Recursively upload all files under a directory (preserves relative paths).
+        /// Go module proxy cache trees (`…/@v/*.zip` + `.mod`) use the Go protocol.
+        #[arg(long = "from-dir", value_name = "DIR", conflicts_with = "from_archive")]
+        from_dir: Option<PathBuf>,
+
+        /// Upload one multi-module archive as a single blob (not unpacked on the client;
+        /// server-side ingest comes later). Prefer packs from `ak download`.
+        #[arg(long = "from-archive", value_name = "FILE", conflicts_with = "from_dir")]
+        from_archive: Option<PathBuf>,
+
+        /// Skip uploads when the repo already has the same path with the same SHA-256
+        /// (Go protocol: HEAD on `.mod` to skip known module versions)
+        #[arg(long = "skip-dupe-uploads")]
+        skip_dupe_uploads: bool,
 
         /// Target path within the repository
         #[arg(long)]
@@ -152,6 +170,9 @@ impl ArtifactCommand {
             Self::Push {
                 repo,
                 files,
+                from_dir,
+                from_archive,
+                skip_dupe_uploads,
                 path,
                 chunk_size,
                 no_chunked,
@@ -159,6 +180,9 @@ impl ArtifactCommand {
                 push(
                     &repo,
                     &files,
+                    from_dir.as_deref(),
+                    from_archive.as_deref(),
+                    skip_dupe_uploads,
                     path.as_deref(),
                     &chunk_size,
                     no_chunked,
@@ -210,6 +234,9 @@ impl ArtifactCommand {
 async fn push(
     repo: &str,
     file_patterns: &[String],
+    from_dir: Option<&Path>,
+    from_archive: Option<&Path>,
+    skip_dupe_uploads: bool,
     target_path: Option<&str>,
     chunk_size_str: &str,
     no_chunked: bool,
@@ -219,45 +246,144 @@ async fn push(
     let chunk_size = super::chunked_upload::parse_size(chunk_size_str)?;
     let threshold = super::chunked_upload::chunked_threshold()?;
 
-    let mut files_to_upload: Vec<PathBuf> = Vec::new();
-    for pattern in file_patterns {
-        let matches: Vec<_> = glob::glob(pattern)
-            .into_diagnostic()?
-            .filter_map(|r| r.ok())
-            .filter(|p| p.is_file())
-            .collect();
-
-        if matches.is_empty() {
-            let path = PathBuf::from(pattern);
-            if path.is_file() {
-                files_to_upload.push(path);
-            } else {
-                return Err(
-                    AkError::ConfigError(format!("No files match pattern: {pattern}")).into(),
-                );
-            }
-        } else {
-            files_to_upload.extend(matches);
+    // Whole-archive upload: one network transfer; server unpack/ingest is separate work.
+    if let Some(archive) = from_archive {
+        if !archive.is_file() {
+            return Err(AkError::ConfigError(format!(
+                "--from-archive is not a file: {}",
+                archive.display()
+            ))
+            .into());
         }
+        let name = archive
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("ferry.zip")
+            .to_string();
+        let artifact_path = match target_path {
+            Some(p) => {
+                let p = p.trim_matches('/');
+                if p.is_empty() {
+                    name
+                } else if p.contains('.') && !p.contains('/') {
+                    // treat as full path override when it looks like a filename
+                    p.to_string()
+                } else {
+                    format!("{p}/{name}")
+                }
+            }
+            None => format!("ak-ferry/{name}"),
+        };
+        return push_items(
+            repo,
+            &[UploadItem {
+                local_path: archive.to_path_buf(),
+                artifact_path,
+            }],
+            skip_dupe_uploads,
+            &base_url,
+            &auth_header,
+            chunk_size,
+            threshold,
+            no_chunked,
+            global,
+        )
+        .await;
     }
 
-    for file_path in &files_to_upload {
+    // Go module proxy / download-cache tree → protocol PUT /go/{repo}/…
+    if let Some(dir) = from_dir
+        && super::go_proxy::looks_like_go_proxy_cache(dir)
+    {
+        if target_path.is_some() {
+            return Err(AkError::ConfigError(
+                "--path is not supported with Go module proxy cache uploads (module paths come from the tree)".into(),
+            )
+            .into());
+        }
+        let (uploaded, skipped) = super::go_proxy::push_go_proxy_cache(
+            &base_url,
+            &auth_header,
+            repo,
+            dir,
+            skip_dupe_uploads,
+            &global.format,
+        )
+        .await?;
+        if !matches!(global.format, OutputFormat::Quiet) {
+            if skip_dupe_uploads {
+                eprintln!("Done: uploaded {uploaded} module(s), skipped {skipped} dupe(s).");
+            } else {
+                eprintln!("Uploaded {uploaded} Go module version(s).");
+            }
+        }
+        return Ok(());
+    }
+
+    let items = collect_upload_items(file_patterns, from_dir, target_path)?;
+    if items.is_empty() {
+        return Err(AkError::ConfigError(
+            "No files to upload (directory empty or patterns matched nothing)".into(),
+        )
+        .into());
+    }
+
+    push_items(
+        repo,
+        &items,
+        skip_dupe_uploads,
+        &base_url,
+        &auth_header,
+        chunk_size,
+        threshold,
+        no_chunked,
+        global,
+    )
+    .await
+}
+
+async fn push_items(
+    repo: &str,
+    items: &[UploadItem],
+    skip_dupe_uploads: bool,
+    base_url: &str,
+    auth_header: &str,
+    chunk_size: u64,
+    threshold: u64,
+    no_chunked: bool,
+    global: &GlobalArgs,
+) -> Result<()> {
+
+    let remote_checksums = if skip_dupe_uploads {
+        let spinner = output::spinner("Fetching repository artifact index for dupe checks...");
+        let map = fetch_remote_checksum_index(repo, global).await;
+        spinner.finish_and_clear();
+        Some(map?)
+    } else {
+        None
+    };
+
+    let mut uploaded = 0usize;
+    let mut skipped = 0usize;
+
+    for item in items {
+        let file_path = &item.local_path;
+        let artifact_path = &item.artifact_path;
         let file_name = file_path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
 
-        let artifact_path = target_path
-            .map(|p| {
-                if p.ends_with('/') {
-                    format!("{p}{file_name}")
-                } else if files_to_upload.len() > 1 {
-                    format!("{p}/{file_name}")
-                } else {
-                    p.to_string()
+        if let Some(ref remote) = remote_checksums {
+            let local_sha = super::chunked_upload::sha256_file(file_path).await?;
+            if remote.get(artifact_path).is_some_and(|sha| sha == &local_sha) {
+                skipped += 1;
+                if !matches!(global.format, OutputFormat::Quiet) {
+                    eprintln!("  skip dupe: {artifact_path}");
                 }
-            })
-            .unwrap_or_else(|| file_name.to_string());
+                continue;
+            }
+        }
 
         let file_size = tokio::fs::metadata(file_path)
             .await
@@ -267,19 +393,19 @@ async fn push(
         let use_chunked = !no_chunked && file_size >= threshold;
 
         if use_chunked {
-            // Chunked upload for large files
             let result = super::chunked_upload::chunked_upload(
                 &base_url,
                 &auth_header,
                 file_path,
                 repo,
-                &artifact_path,
+                artifact_path,
                 chunk_size,
                 file_size,
                 file_name,
             )
             .await?;
 
+            uploaded += 1;
             if matches!(global.format, OutputFormat::Quiet) {
                 println!("{}", result.path);
             } else {
@@ -292,7 +418,6 @@ async fn push(
                 );
             }
         } else {
-            // Single PUT for small files
             let pb = indicatif::ProgressBar::new(file_size);
             pb.set_style(
                 indicatif::ProgressStyle::with_template(
@@ -315,9 +440,10 @@ async fn push(
             let body = reqwest::Body::wrap_stream(stream);
 
             let resp =
-                single_put_upload(&base_url, &auth_header, repo, &artifact_path, body).await?;
+                single_put_upload(&base_url, &auth_header, repo, artifact_path, body).await?;
 
             pb.finish_with_message(format!("Uploaded {file_name}"));
+            uploaded += 1;
 
             if matches!(global.format, OutputFormat::Quiet) {
                 println!("{}", resp.path);
@@ -333,11 +459,188 @@ async fn push(
         }
     }
 
-    if !matches!(global.format, OutputFormat::Quiet) && files_to_upload.len() > 1 {
-        eprintln!("Uploaded {} files.", files_to_upload.len());
+    if !matches!(global.format, OutputFormat::Quiet) && (uploaded > 1 || skipped > 0) {
+        if skip_dupe_uploads {
+            eprintln!("Done: uploaded {uploaded}, skipped {skipped} dupe(s).");
+        } else {
+            eprintln!("Uploaded {uploaded} files.");
+        }
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct UploadItem {
+    local_path: PathBuf,
+    artifact_path: String,
+}
+
+fn collect_upload_items(
+    file_patterns: &[String],
+    from_dir: Option<&Path>,
+    target_path: Option<&str>,
+) -> Result<Vec<UploadItem>> {
+    let mut items: Vec<UploadItem> = Vec::new();
+
+    if let Some(dir) = from_dir {
+        if !dir.is_dir() {
+            return Err(AkError::ConfigError(format!(
+                "--from-dir is not a directory: {}",
+                dir.display()
+            ))
+            .into());
+        }
+        let root = dir
+            .canonicalize()
+            .map_err(|e| AkError::ConfigError(format!("Cannot resolve {}: {e}", dir.display())))?;
+        collect_dir_files(&root, &root, &mut items)?;
+        if let Some(prefix) = target_path {
+            let prefix = prefix.trim_matches('/');
+            if !prefix.is_empty() {
+                for item in &mut items {
+                    item.artifact_path = format!("{prefix}/{}", item.artifact_path);
+                }
+            }
+        }
+    }
+
+    for pattern in file_patterns {
+        let matches: Vec<_> = glob::glob(pattern)
+            .into_diagnostic()?
+            .filter_map(|r| r.ok())
+            .filter(|p| p.is_file())
+            .collect();
+
+        if matches.is_empty() {
+            let path = PathBuf::from(pattern);
+            if path.is_file() {
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let artifact_path = resolve_pattern_artifact_path(
+                    target_path,
+                    &file_name,
+                    file_patterns.len() + items.len() > 1,
+                );
+                items.push(UploadItem {
+                    local_path: path,
+                    artifact_path,
+                });
+            } else {
+                return Err(
+                    AkError::ConfigError(format!("No files match pattern: {pattern}")).into(),
+                );
+            }
+        } else {
+            let multi = matches.len() + items.len() > 1 || file_patterns.len() > 1;
+            for path in matches {
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let artifact_path =
+                    resolve_pattern_artifact_path(target_path, &file_name, multi);
+                items.push(UploadItem {
+                    local_path: path,
+                    artifact_path,
+                });
+            }
+        }
+    }
+
+    Ok(items)
+}
+
+fn resolve_pattern_artifact_path(
+    target_path: Option<&str>,
+    file_name: &str,
+    multi_file: bool,
+) -> String {
+    target_path
+        .map(|p| {
+            if p.ends_with('/') {
+                format!("{p}{file_name}")
+            } else if multi_file {
+                format!("{p}/{file_name}")
+            } else {
+                p.to_string()
+            }
+        })
+        .unwrap_or_else(|| file_name.to_string())
+}
+
+fn collect_dir_files(root: &Path, current: &Path, out: &mut Vec<UploadItem>) -> Result<()> {
+    let mut entries: Vec<_> = std::fs::read_dir(current)
+        .map_err(|e| AkError::ConfigError(format!("Cannot read {}: {e}", current.display())))?
+        .filter_map(|e| e.ok())
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let meta = entry.metadata().map_err(|e| {
+            AkError::ConfigError(format!("Cannot stat {}: {e}", path.display()))
+        })?;
+        if meta.is_dir() {
+            collect_dir_files(root, &path, out)?;
+        } else if meta.is_file() {
+            let rel = path.strip_prefix(root).map_err(|_| {
+                AkError::ConfigError(format!(
+                    "Path {} is not under {}",
+                    path.display(),
+                    root.display()
+                ))
+            })?;
+            let artifact_path = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            out.push(UploadItem {
+                local_path: path,
+                artifact_path,
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn fetch_remote_checksum_index(
+    repo: &str,
+    global: &GlobalArgs,
+) -> Result<std::collections::HashMap<String, String>> {
+    let client = client_for(global)?;
+    let mut map = std::collections::HashMap::new();
+    let mut page = 1_i32;
+    let per_page = 100_i32;
+
+    loop {
+        let resp = client
+            .list_artifacts()
+            .key(repo)
+            .page(page)
+            .per_page(per_page)
+            .send()
+            .await
+            .map_err(|e| {
+                AkError::ServerError(format!("Failed to list artifacts for dupe check: {e}"))
+            })?;
+
+        for artifact in &resp.items {
+            map.insert(artifact.path.clone(), artifact.checksum_sha256.clone());
+        }
+
+        if resp.pagination.total_pages == 0 || page >= resp.pagination.total_pages {
+            break;
+        }
+        page += 1;
+    }
+
+    Ok(map)
 }
 
 /// Response from the single-PUT upload endpoint (the subset of the API's
@@ -1191,6 +1494,102 @@ mod tests {
     }
 
     #[test]
+    fn parse_push_from_dir_without_files() {
+        let cli = parse(&["test", "push", "my-repo", "--from-dir", "./mirror"]);
+        if let ArtifactCommand::Push {
+            repo,
+            files,
+            from_dir,
+            from_archive,
+            skip_dupe_uploads,
+            ..
+        } = cli.command
+        {
+            assert_eq!(repo, "my-repo");
+            assert!(files.is_empty());
+            assert_eq!(
+                from_dir.as_deref(),
+                Some(std::path::Path::new("./mirror"))
+            );
+            assert!(from_archive.is_none());
+            assert!(!skip_dupe_uploads);
+        } else {
+            panic!("Expected ArtifactCommand::Push");
+        }
+    }
+
+    #[test]
+    fn parse_push_from_archive_without_files() {
+        let cli = parse(&[
+            "test",
+            "push",
+            "my-repo",
+            "--from-archive",
+            "./ferry.zip",
+        ]);
+        if let ArtifactCommand::Push {
+            files,
+            from_archive,
+            from_dir,
+            ..
+        } = cli.command
+        {
+            assert!(files.is_empty());
+            assert!(from_dir.is_none());
+            assert_eq!(
+                from_archive.as_deref(),
+                Some(std::path::Path::new("./ferry.zip"))
+            );
+        } else {
+            panic!("Expected ArtifactCommand::Push");
+        }
+    }
+
+    #[test]
+    fn parse_push_skip_dupe_uploads_flag() {
+        let cli = parse(&[
+            "test",
+            "push",
+            "my-repo",
+            "--from-dir",
+            "./mirror",
+            "--skip-dupe-uploads",
+        ]);
+        if let ArtifactCommand::Push {
+            skip_dupe_uploads, ..
+        } = cli.command
+        {
+            assert!(skip_dupe_uploads);
+        } else {
+            panic!("Expected ArtifactCommand::Push");
+        }
+    }
+
+    #[test]
+    fn collect_dir_preserves_relative_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("github.com").join("foo").join("@v");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("v1.0.0.zip"), b"zip").unwrap();
+        std::fs::write(nested.join("v1.0.0.mod"), b"mod").unwrap();
+
+        let items = collect_upload_items(&[], Some(tmp.path()), None).unwrap();
+        let paths: Vec<_> = items.iter().map(|i| i.artifact_path.as_str()).collect();
+        assert!(paths.contains(&"github.com/foo/@v/v1.0.0.zip"));
+        assert!(paths.contains(&"github.com/foo/@v/v1.0.0.mod"));
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn collect_dir_with_path_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.whl"), b"whl").unwrap();
+        let items = collect_upload_items(&[], Some(tmp.path()), Some("vendor/")).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].artifact_path, "vendor/a.whl");
+    }
+
+    #[test]
     fn parse_push_missing_repo_fails() {
         assert!(try_parse(&["test", "push"]).is_err());
     }
@@ -1999,6 +2398,9 @@ mod tests {
             "my-repo",
             &[file.to_string_lossy().into_owned()],
             None,
+            None,
+            false,
+            None,
             "8MB",
             false,
             &global,
@@ -2030,6 +2432,9 @@ mod tests {
         let result = push(
             "my-repo",
             &[file.to_string_lossy().into_owned()],
+            None,
+            None,
+            false,
             None,
             "8MB",
             false,
@@ -2065,6 +2470,9 @@ mod tests {
         let result = push(
             "my-repo",
             &[file.to_string_lossy().into_owned()],
+            None,
+            None,
+            false,
             Some("nested/dir/"),
             "8MB",
             false,
@@ -2097,6 +2505,9 @@ mod tests {
         let result = push(
             "no-such-repo",
             &[file.to_string_lossy().into_owned()],
+            None,
+            None,
+            false,
             None,
             "8MB",
             false,

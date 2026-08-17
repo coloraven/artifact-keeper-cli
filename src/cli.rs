@@ -90,11 +90,20 @@ pub enum Command {
 
     /// Upload, download, search, and manage artifacts
     #[command(
-        after_help = "Examples:\n  ak artifact push my-repo ./package-1.0.tar.gz\n  ak artifact pull my-repo org/pkg/1.0/pkg-1.0.jar -o pkg.jar\n  ak artifact list my-repo\n  ak artifact search \"log4j\" --pkg-format maven\n  ak artifact copy src-repo/path dst-repo/path\n  ak artifact copy src/path dst/path --from-instance staging --to-instance prod"
+        after_help = "Examples:\n  ak artifact push my-repo ./package-1.0.tar.gz\n  ak artifact push my-repo --from-dir ./mirror --skip-dupe-uploads\n  ak artifact push go-local --from-dir ./gomodcache/cache/download --skip-dupe-uploads\n  ak artifact push go-local --from-archive ./ak-ferry-go.zip\n  ak artifact pull my-repo org/pkg/1.0/pkg-1.0.jar -o pkg.jar\n  ak artifact list my-repo\n  ak artifact search \"log4j\" --pkg-format maven\n  ak artifact copy src-repo/path dst-repo/path\n  ak artifact copy src/path dst/path --from-instance staging --to-instance prod"
     )]
     Artifact {
         #[command(subcommand)]
         command: commands::artifact::ArtifactCommand,
+    },
+
+    /// Build an air-gap ferry zip via language toolchains (isolated per root module)
+    #[command(
+        after_help = "Examples:\n  ak download catalog npm-local -o ak-catalog.jsonl\n  ak download catalog npm-local --include-artifacts -o ak-catalog.jsonl\n  ak download --npm package.json --catalog ak-catalog.jsonl -o ferry-npm.zip\n  ak download --go go.mod -o ferry-go.zip\n  ak download --pypi requirements.txt -o ferry-pypi.zip\n  ak download --cargo Cargo.toml -o ferry-cargo.zip\n  ak download --config download.config\n\nWorkflow: on the intranet host run `ak download catalog <repo>` and copy the JSONL to the internet host; pass `--catalog` so ferry download skips packages already on the server. Prefer download.config for multi-ecosystem plans."
+    )]
+    Download {
+        #[command(flatten)]
+        args: commands::download::DownloadArgs,
     },
 
     /// Configure local package managers to use Artifact Keeper
@@ -485,6 +494,7 @@ impl Cli {
             Command::Instance { command } => command.execute(&global).await,
             Command::Repo { command } => command.execute(&global).await,
             Command::Artifact { command } => command.execute(&global).await,
+            Command::Download { args } => args.execute(&global).await,
             Command::Setup { command } => command.execute(&global).await,
             Command::Scan { command } => command.execute(&global).await,
             Command::Doctor => commands::doctor::execute(&global).await,
@@ -754,6 +764,193 @@ mod tests {
     fn parse_artifact_copy() {
         let cli = parse(&["ak", "artifact", "copy", "src/path", "dst/path"]).unwrap();
         assert!(matches!(cli.command, Command::Artifact { .. }));
+    }
+
+    #[test]
+    fn parse_download_go() {
+        let cli = parse(&["ak", "download", "--go", "go.mod", "-o", "out.zip"]).unwrap();
+        match cli.command {
+            Command::Download { args } => {
+                assert!(args.ecosystem.go);
+                assert!(!args.ecosystem.npm);
+                assert!(!args.all_versions);
+                assert_eq!(args.input, Some(std::path::PathBuf::from("go.mod")));
+                assert_eq!(args.output, std::path::PathBuf::from("out.zip"));
+            }
+            _ => panic!("Expected Download"),
+        }
+    }
+
+    #[test]
+    fn parse_download_all_versions() {
+        let cli = parse(&[
+            "ak",
+            "download",
+            "--npm",
+            "package.json",
+            "--all-versions",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Download { args } => {
+                assert!(args.ecosystem.npm);
+                assert!(args.all_versions);
+            }
+            _ => panic!("Expected Download"),
+        }
+    }
+
+    #[test]
+    fn parse_download_npm_targets() {
+        let cli = parse(&[
+            "ak",
+            "download",
+            "--npm",
+            "package.json",
+            "--target",
+            "linux-x64",
+            "--target",
+            "darwin-arm64,win32-x64",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Download { args } => {
+                assert_eq!(args.targets.len(), 2);
+                assert_eq!(args.targets[0], "linux-x64");
+                assert_eq!(args.targets[1], "darwin-arm64,win32-x64");
+            }
+            _ => panic!("Expected Download"),
+        }
+    }
+
+    #[test]
+    fn parse_download_npm_nodes() {
+        let cli = parse(&[
+            "ak",
+            "download",
+            "--npm",
+            "package.json",
+            "--node",
+            "18",
+            "--node",
+            "20,20.11.0",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Download { args } => {
+                assert_eq!(args.nodes.len(), 2);
+                assert_eq!(args.nodes[0], "18");
+                assert_eq!(args.nodes[1], "20,20.11.0");
+            }
+            _ => panic!("Expected Download"),
+        }
+    }
+
+    #[test]
+    fn parse_download_jobs() {
+        let cli = parse(&[
+            "ak",
+            "download",
+            "--npm",
+            "package.json",
+            "-j",
+            "8",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Download { args } => {
+                assert_eq!(args.jobs, Some(8));
+            }
+            _ => panic!("Expected Download"),
+        }
+    }
+
+    #[test]
+    fn parse_download_pypi() {
+        let cli = parse(&[
+            "ak",
+            "download",
+            "--pypi",
+            "requirements.txt",
+            "--target",
+            "manylinux2014_x86_64",
+            "--node",
+            "3.12",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Download { args } => {
+                assert!(args.ecosystem.pypi);
+                assert_eq!(args.targets, vec!["manylinux2014_x86_64"]);
+                assert_eq!(args.nodes, vec!["3.12"]);
+            }
+            _ => panic!("Expected Download"),
+        }
+    }
+
+    #[test]
+    fn parse_download_cargo() {
+        let cli = parse(&["ak", "download", "--cargo", "Cargo.toml", "-o", "c.zip"]).unwrap();
+        match cli.command {
+            Command::Download { args } => {
+                assert!(args.ecosystem.cargo);
+                assert_eq!(args.output, std::path::PathBuf::from("c.zip"));
+            }
+            _ => panic!("Expected Download"),
+        }
+    }
+
+    #[test]
+    fn parse_download_catalog_subcommand() {
+        let cli = parse(&[
+            "ak",
+            "download",
+            "catalog",
+            "npm-local",
+            "-o",
+            "cat.jsonl",
+            "--include-artifacts",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Download { args } => match args.command {
+                Some(commands::download::DownloadSubcommand::Catalog {
+                    repo,
+                    output,
+                    include_artifacts,
+                    ..
+                }) => {
+                    assert_eq!(repo, "npm-local");
+                    assert_eq!(output, std::path::PathBuf::from("cat.jsonl"));
+                    assert!(include_artifacts);
+                }
+                _ => panic!("Expected catalog subcommand"),
+            },
+            _ => panic!("Expected Download"),
+        }
+    }
+
+    #[test]
+    fn parse_download_with_catalog_flag() {
+        let cli = parse(&[
+            "ak",
+            "download",
+            "--npm",
+            "package.json",
+            "--catalog",
+            "ak-catalog.jsonl",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Download { args } => {
+                assert!(args.ecosystem.npm);
+                assert_eq!(
+                    args.catalog,
+                    Some(std::path::PathBuf::from("ak-catalog.jsonl"))
+                );
+            }
+            _ => panic!("Expected Download"),
+        }
     }
 
     #[test]
