@@ -256,8 +256,13 @@ fn fetch_with_deps(
         Some(v) if !v.is_empty() => format!("{} = \"{v}\"", root.name),
         _ => format!("{} = \"*\"", root.name),
     };
+    // Explicit `[workspace]` makes this isolate its own workspace root so
+    // `cargo fetch` does not walk up into a parent Cargo.toml (e.g. when the
+    // work-dir lives inside another Rust git checkout).
     let cargo_toml = format!(
-        "[package]\n\
+        "[workspace]\n\
+         \n\
+         [package]\n\
          name = \"ak-ferry-isolate\"\n\
          version = \"0.0.0\"\n\
          edition = \"2021\"\n\
