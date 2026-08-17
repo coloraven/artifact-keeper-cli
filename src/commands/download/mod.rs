@@ -34,7 +34,7 @@ use crate::output::OutputFormat;
 // Re-export so new ecosystems (pypi/cargo/…) can implement the shared engine trait.
 #[allow(unused_imports)]
 pub use self::engine::{FerryOpts, LanguageToolchain, RootPass, WorkDirs};
-pub use self::catalog::export_catalog;
+pub use self::catalog::{default_catalog_output, export_catalog};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ecosystem {

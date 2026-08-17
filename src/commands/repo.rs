@@ -221,9 +221,9 @@ pub enum RepoCommand {
         /// Repository key
         key: String,
 
-        /// Output JSONL path
-        #[arg(short, long, default_value = "ak-catalog.jsonl")]
-        output: PathBuf,
+        /// Output JSONL path. Default: `<instance>-<repo>-<YYYYMMDDHHMMSS>.jsonl`
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
 
         /// Only include these ecosystems (`npm`, `go`, `pypi`, `cargo`). Repeatable.
         #[arg(long = "ecosystem", value_name = "ECO", action = clap::ArgAction::Append)]
@@ -508,6 +508,15 @@ impl RepoCommand {
                 formats,
                 include_artifacts,
             } => {
+                let output = match output {
+                    Some(p) => p,
+                    None => {
+                        let config = crate::config::AppConfig::load()?;
+                        let (instance_name, _) =
+                            config.resolve_instance(global.instance.as_deref())?;
+                        crate::commands::download::default_catalog_output(&instance_name, &key)
+                    }
+                };
                 crate::commands::download::export_catalog(
                     &key,
                     &output,
@@ -2058,9 +2067,20 @@ mod tests {
         } = cli.command
         {
             assert_eq!(key, "npm-local");
-            assert_eq!(output, std::path::PathBuf::from("cat.jsonl"));
+            assert_eq!(output, Some(std::path::PathBuf::from("cat.jsonl")));
             assert_eq!(formats, vec!["npm".to_string()]);
             assert!(include_artifacts);
+        } else {
+            panic!("Expected RepoCommand::Catalog");
+        }
+    }
+
+    #[test]
+    fn parse_catalog_default_output_none() {
+        let cli = parse(&["test", "catalog", "go-local"]);
+        if let RepoCommand::Catalog { key, output, .. } = cli.command {
+            assert_eq!(key, "go-local");
+            assert!(output.is_none());
         } else {
             panic!("Expected RepoCommand::Catalog");
         }

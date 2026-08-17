@@ -81,7 +81,7 @@ pub enum Command {
 
     /// Browse and manage repositories
     #[command(
-        after_help = "Examples:\n  ak repo list\n  ak repo list --pkg-format npm\n  ak repo show my-npm-repo\n  ak repo create my-pypi --pkg-format pypi --repo-type local\n  ak repo create pypi-proxy --pkg-format pypi --repo-type remote --upstream-url https://pypi.org\n  ak repo catalog npm-local -o ak-catalog.jsonl\n  ak repo catalog go-local --include-artifacts -o go-catalog.jsonl"
+        after_help = "Examples:\n  ak repo list\n  ak repo list --pkg-format npm\n  ak repo show my-npm-repo\n  ak repo create my-pypi --pkg-format pypi --repo-type local\n  ak repo create pypi-proxy --pkg-format pypi --repo-type remote --upstream-url https://pypi.org\n  ak repo catalog npm-local\n  ak repo catalog go-local --include-artifacts -o go-catalog.jsonl"
     )]
     Repo {
         #[command(subcommand)]
@@ -99,7 +99,7 @@ pub enum Command {
 
     /// Build an air-gap ferry zip via language toolchains (isolated per root module)
     #[command(
-        after_help = "Examples:\n  ak repo catalog npm-local -o ak-catalog.jsonl\n  ak download --npm package.json --catalog ak-catalog.jsonl\n  ak download --go go.mod\n  ak download --pypi requirements.txt\n  ak download --cargo Cargo.toml\n  ak download --config download.config\n\nWorkflow: on the intranet host run `ak repo catalog <repo>` and copy the JSONL to the internet host; pass `--catalog` so ferry download skips packages already on the server. Prefer download.config for multi-ecosystem plans."
+        after_help = "Examples:\n  ak repo catalog npm-local\n  ak download --npm package.json --catalog registry-npm-local-20260818073500.jsonl\n  ak download --go go.mod\n  ak download --pypi requirements.txt\n  ak download --cargo Cargo.toml\n  ak download --config download.config\n\nWorkflow: on the intranet host run `ak repo catalog <repo>` and copy the JSONL to the internet host; pass `--catalog` so ferry download skips packages already on the server. Prefer download.config for multi-ecosystem plans."
     )]
     Download {
         #[command(flatten)]
@@ -933,8 +933,23 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(key, "npm-local");
-                    assert_eq!(output, std::path::PathBuf::from("cat.jsonl"));
+                    assert_eq!(output, Some(std::path::PathBuf::from("cat.jsonl")));
                     assert!(include_artifacts);
+                }
+                _ => panic!("Expected repo catalog"),
+            },
+            _ => panic!("Expected Repo"),
+        }
+    }
+
+    #[test]
+    fn parse_repo_catalog_default_output() {
+        let cli = parse(&["ak", "repo", "catalog", "npm-local"]).unwrap();
+        match cli.command {
+            Command::Repo { command } => match command {
+                commands::repo::RepoCommand::Catalog { key, output, .. } => {
+                    assert_eq!(key, "npm-local");
+                    assert!(output.is_none());
                 }
                 _ => panic!("Expected repo catalog"),
             },

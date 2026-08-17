@@ -5,8 +5,9 @@
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use chrono::Local;
 use miette::Result;
 use serde::{Deserialize, Serialize};
 
@@ -136,6 +137,39 @@ fn format_to_ecosystem(fmt: &str) -> Option<&'static str> {
         "pypi" | "python" => Some("pypi"),
         "cargo" | "crates" | "crate" => Some("cargo"),
         _ => None,
+    }
+}
+
+/// Default catalog path: `<instance>-<repo>-<YYYYMMDDHHMMSS>.jsonl` (local time).
+pub fn default_catalog_output(instance: &str, repo: &str) -> PathBuf {
+    let ts = Local::now().format("%Y%m%d%H%M%S");
+    PathBuf::from(format!(
+        "{}-{}-{ts}.jsonl",
+        sanitize_catalog_part(instance),
+        sanitize_catalog_part(repo),
+    ))
+}
+
+fn sanitize_catalog_part(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut prev_dash = false;
+    for c in raw.chars() {
+        let ok = c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-';
+        if ok {
+            out.push(c);
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "unknown".into()
+    } else {
+        out
     }
 }
 
@@ -451,5 +485,28 @@ mod tests {
         let (n, v) = parse_npm_tarball_path("@scope/pkg/-/pkg-1.0.0.tgz").unwrap();
         assert_eq!(n, "@scope/pkg");
         assert_eq!(v, "1.0.0");
+    }
+
+    #[test]
+    fn default_catalog_output_shape() {
+        let p = default_catalog_output("registry", "npm-local");
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with("registry-npm-local-") && name.ends_with(".jsonl"),
+            "got {name}"
+        );
+        let ts = name
+            .strip_prefix("registry-npm-local-")
+            .unwrap()
+            .strip_suffix(".jsonl")
+            .unwrap();
+        assert_eq!(ts.len(), 14);
+        assert!(ts.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn sanitize_catalog_parts() {
+        assert_eq!(sanitize_catalog_part("npm/local"), "npm-local");
+        assert_eq!(sanitize_catalog_part(""), "unknown");
     }
 }
