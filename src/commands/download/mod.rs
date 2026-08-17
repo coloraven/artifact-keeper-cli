@@ -12,6 +12,7 @@ mod engine;
 mod errors;
 mod go;
 mod manifest;
+mod naming;
 mod npm;
 mod pack;
 mod parallel;
@@ -20,7 +21,7 @@ mod pypi;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use clap::{Args, Subcommand};
+use clap::Args;
 use miette::Result;
 
 use self::cache::{default_cache_db_path, DownloadCache};
@@ -33,6 +34,7 @@ use crate::output::OutputFormat;
 // Re-export so new ecosystems (pypi/cargo/…) can implement the shared engine trait.
 #[allow(unused_imports)]
 pub use self::engine::{FerryOpts, LanguageToolchain, RootPass, WorkDirs};
+pub use self::catalog::export_catalog;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ecosystem {
@@ -43,7 +45,7 @@ pub enum Ecosystem {
 }
 
 /// Mutually exclusive ecosystem flags (`--go` / `--npm` / `--pypi` / `--cargo`).
-/// Not required when using `--config` / `download.config` / `catalog` subcommand.
+/// Not required when using `--config` / `download.config`.
 #[derive(Args, Debug)]
 #[group(required = false, multiple = false)]
 pub struct EcosystemArgs {
@@ -64,36 +66,9 @@ pub struct EcosystemArgs {
     pub cargo: bool,
 }
 
-#[derive(Subcommand, Debug)]
-pub enum DownloadSubcommand {
-    /// Export package inventory from an Artifact Keeper repository (intranet).
-    ///
-    /// Take the JSONL file to the internet host and pass `--catalog` so
-    /// `ak download` skips modules already present on the server.
-    Catalog {
-        /// Repository key on the Artifact Keeper instance
-        repo: String,
-
-        /// Output JSONL path
-        #[arg(short, long, default_value = "ak-catalog.jsonl")]
-        output: PathBuf,
-
-        /// Only include these ecosystems (`npm`, `go`, `pypi`, `cargo`). Repeatable.
-        #[arg(long = "ecosystem", value_name = "ECO", action = clap::ArgAction::Append)]
-        formats: Vec<String>,
-
-        /// Also scrape artifact paths (helps Go proxy layouts / raw tarball paths)
-        #[arg(long = "include-artifacts")]
-        include_artifacts: bool,
-    },
-}
-
 /// Build an air-gap ferry zip from a module list / lockfile using native toolchains.
 #[derive(Args, Debug)]
 pub struct DownloadArgs {
-    #[command(subcommand)]
-    pub command: Option<DownloadSubcommand>,
-
     #[command(flatten)]
     pub ecosystem: EcosystemArgs,
 
@@ -111,14 +86,16 @@ pub struct DownloadArgs {
     #[arg(long = "config", value_name = "FILE")]
     pub config: Option<PathBuf>,
 
-    /// Server catalog JSONL from `ak download catalog` — skip packages already
+    /// Server catalog JSONL from `ak repo catalog` — skip packages already
     /// present on the intranet Artifact Keeper repo.
     #[arg(long = "catalog", value_name = "FILE")]
     pub catalog: Option<PathBuf>,
 
-    /// Output zip path (CLI mode, or default override)
-    #[arg(short, long, default_value = "ak-ferry.zip")]
-    pub output: PathBuf,
+    /// Output zip path. When omitted, writes
+    /// `ak-ferry-{ecosystem}-{timestamp}[-opts][-rN-mM].zip` in the current directory
+    /// (or the config `output_dir`).
+    #[arg(short, long, value_name = "OUTPUT")]
+    pub output: Option<PathBuf>,
 
     /// Keep / reuse work directory during the run (default: temp).
     /// Downloaded modules under this dir are still deleted after the ferry zip is written.
@@ -166,23 +143,6 @@ pub struct DownloadArgs {
 
 impl DownloadArgs {
     pub async fn execute(self, global: &GlobalArgs) -> Result<()> {
-        if let Some(DownloadSubcommand::Catalog {
-            repo,
-            output,
-            formats,
-            include_artifacts,
-        }) = self.command
-        {
-            return catalog::export_catalog(
-                &repo,
-                &output,
-                &formats,
-                include_artifacts,
-                global,
-            )
-            .await;
-        }
-
         let cli_eco = if self.ecosystem.go {
             Some(Ecosystem::Go)
         } else if self.ecosystem.npm {
@@ -283,6 +243,7 @@ async fn run_cli_job(
         ecosystem: eco,
         input,
         output: args.output.clone(),
+        output_dir: PathBuf::from("."),
         all_versions: args.all_versions,
         targets: args.targets.clone(),
         nodes,
@@ -511,6 +472,19 @@ async fn run_jobs(
             AkError::ConfigError(format!("Cannot create {}: {e}", job_work.display()))
         })?;
 
+        let (output, auto_name) = naming::resolve_job_output(
+            job.output.as_deref(),
+            &job.output_dir,
+            job.ecosystem,
+            job.all_versions,
+            &job.targets,
+            &job.nodes,
+            catalog.is_some(),
+        );
+        if auto_name && !matches!(global.format, OutputFormat::Quiet) {
+            eprintln!("auto output: {}", output.display());
+        }
+
         match job.ecosystem {
             Ecosystem::Go => {
                 if !job.targets.is_empty() && !matches!(global.format, OutputFormat::Quiet) {
@@ -529,13 +503,14 @@ async fn run_jobs(
                 go::download_go(
                     &job.input,
                     &job_work,
-                    &job.output,
+                    &output,
                     job.all_versions,
                     &upstream,
                     Arc::clone(cache),
                     catalog.cloned(),
                     jobs_n,
                     &global.format,
+                    auto_name,
                 )
                 .await?;
             }
@@ -561,7 +536,7 @@ async fn run_jobs(
                 npm::download_npm(
                     &job.input,
                     &job_work,
-                    &job.output,
+                    &output,
                     job.all_versions,
                     &npm_targets,
                     &nodes,
@@ -570,6 +545,7 @@ async fn run_jobs(
                     catalog.cloned(),
                     jobs_n,
                     &global.format,
+                    auto_name,
                 )
                 .await?;
             }
@@ -589,7 +565,7 @@ async fn run_jobs(
                 pypi::download_pypi(
                     &job.input,
                     &job_work,
-                    &job.output,
+                    &output,
                     job.all_versions,
                     &job.targets,
                     &job.nodes,
@@ -598,6 +574,7 @@ async fn run_jobs(
                     catalog.cloned(),
                     jobs_n,
                     &global.format,
+                    auto_name,
                 )
                 .await?;
             }
@@ -623,13 +600,14 @@ async fn run_jobs(
                 cargo::download_cargo(
                     &job.input,
                     &job_work,
-                    &job.output,
+                    &output,
                     job.all_versions,
                     &upstream,
                     Arc::clone(cache),
                     catalog.cloned(),
                     jobs_n,
                     &global.format,
+                    auto_name,
                 )
                 .await?;
             }

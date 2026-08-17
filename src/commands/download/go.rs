@@ -22,6 +22,7 @@ pub async fn download_go(
     catalog: Option<std::sync::Arc<super::catalog::ServerCatalog>>,
     jobs: usize,
     format: &OutputFormat,
+    auto_name: bool,
 ) -> Result<()> {
     let tool = std::sync::Arc::new(GoToolchain);
     super::engine::run_ferry(
@@ -36,6 +37,7 @@ pub async fn download_go(
             catalog,
             jobs,
             format: format.clone(),
+            auto_name,
         },
     )
     .await

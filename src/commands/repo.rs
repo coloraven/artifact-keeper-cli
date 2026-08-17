@@ -3,6 +3,7 @@ use clap::Subcommand;
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL_CONDENSED};
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result};
+use std::path::PathBuf;
 
 use super::client::{client_for, client_for_optional_auth};
 use super::helpers::{confirm_action, emit_mutation, new_table, sdk_err};
@@ -210,6 +211,27 @@ pub enum RepoCommand {
         /// Maximum number of bytes to fetch (truncates the response)
         #[arg(long = "max-bytes")]
         max_bytes: Option<i64>,
+    },
+
+    /// Export package / module index metadata from a repository (JSONL).
+    ///
+    /// Intended for air-gap ferry: copy the JSONL to the internet host and pass
+    /// it to `ak download --catalog` so already-present packages are skipped.
+    Catalog {
+        /// Repository key
+        key: String,
+
+        /// Output JSONL path
+        #[arg(short, long, default_value = "ak-catalog.jsonl")]
+        output: PathBuf,
+
+        /// Only include these ecosystems (`npm`, `go`, `pypi`, `cargo`). Repeatable.
+        #[arg(long = "ecosystem", value_name = "ECO", action = clap::ArgAction::Append)]
+        formats: Vec<String>,
+
+        /// Also scrape artifact paths (helps Go proxy layouts / raw tarball paths)
+        #[arg(long = "include-artifacts")]
+        include_artifacts: bool,
     },
 }
 
@@ -480,6 +502,21 @@ impl RepoCommand {
                 path,
                 max_bytes,
             } => cat_content(&key, &path, max_bytes, global).await,
+            Self::Catalog {
+                key,
+                output,
+                formats,
+                include_artifacts,
+            } => {
+                crate::commands::download::export_catalog(
+                    &key,
+                    &output,
+                    &formats,
+                    include_artifacts,
+                    global,
+                )
+                .await
+            }
         }
     }
 }
@@ -1998,6 +2035,34 @@ mod tests {
             assert_eq!(max_bytes, Some(1024));
         } else {
             panic!("Expected RepoCommand::Cat");
+        }
+    }
+
+    #[test]
+    fn parse_catalog_export() {
+        let cli = parse(&[
+            "test",
+            "catalog",
+            "npm-local",
+            "-o",
+            "cat.jsonl",
+            "--ecosystem",
+            "npm",
+            "--include-artifacts",
+        ]);
+        if let RepoCommand::Catalog {
+            key,
+            output,
+            formats,
+            include_artifacts,
+        } = cli.command
+        {
+            assert_eq!(key, "npm-local");
+            assert_eq!(output, std::path::PathBuf::from("cat.jsonl"));
+            assert_eq!(formats, vec!["npm".to_string()]);
+            assert!(include_artifacts);
+        } else {
+            panic!("Expected RepoCommand::Catalog");
         }
     }
 

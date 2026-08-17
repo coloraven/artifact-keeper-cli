@@ -29,6 +29,7 @@ pub async fn download_cargo(
     catalog: Option<Arc<super::catalog::ServerCatalog>>,
     jobs: usize,
     format: &OutputFormat,
+    auto_name: bool,
 ) -> Result<()> {
     let tool = Arc::new(CargoToolchain { all_versions });
     engine::run_ferry(
@@ -43,6 +44,7 @@ pub async fn download_cargo(
             catalog,
             jobs,
             format: format.clone(),
+            auto_name,
         },
     )
     .await

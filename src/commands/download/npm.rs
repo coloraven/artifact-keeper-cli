@@ -102,6 +102,7 @@ pub async fn download_npm(
     catalog: Option<Arc<super::catalog::ServerCatalog>>,
     jobs: usize,
     format: &OutputFormat,
+    auto_name: bool,
 ) -> Result<()> {
     if all_versions {
         if (!targets.is_empty() || !nodes.is_empty()) && !matches!(format, OutputFormat::Quiet) {
@@ -146,6 +147,7 @@ pub async fn download_npm(
             catalog,
             jobs,
             format: format.clone(),
+            auto_name,
         },
     )
     .await

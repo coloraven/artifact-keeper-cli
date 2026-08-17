@@ -30,7 +30,7 @@ pub struct DownloadConfigFile {
     /// Max concurrent toolchain workers (default: CPU count, max 16)
     pub jobs: Option<usize>,
 
-    /// Server catalog JSONL from `ak download catalog` (skip packages already on server)
+    /// Server catalog JSONL from `ak repo catalog` (skip packages already on server)
     pub catalog: Option<PathBuf>,
 
     /// One or more download jobs (preferred for multi-language ferry packs).
@@ -107,7 +107,10 @@ pub struct DownloadJob {
 pub struct ResolvedJob {
     pub ecosystem: Ecosystem,
     pub input: PathBuf,
-    pub output: PathBuf,
+    /// Explicit zip path from config/CLI. `None` → auto name under [`Self::output_dir`].
+    pub output: Option<PathBuf>,
+    /// Directory for auto-generated ferry zip names (cwd or config `output_dir`).
+    pub output_dir: PathBuf,
     pub all_versions: bool,
     pub targets: Vec<String>,
     pub nodes: Vec<String>,
@@ -256,21 +259,15 @@ impl DownloadConfigFile {
         };
 
         let mut out = Vec::with_capacity(raw_jobs.len());
-        for (i, job) in raw_jobs.into_iter().enumerate() {
+        for job in raw_jobs {
             let ecosystem = parse_ecosystem(&job.ecosystem)?;
             let input = resolve_against(base, &job.input);
-            let output = match &job.output {
-                Some(p) => resolve_against(&output_dir, p),
-                None => output_dir.join(format!(
-                    "ak-ferry-{}-{}.zip",
-                    job.ecosystem.to_ascii_lowercase(),
-                    i + 1
-                )),
-            };
+            let output = job.output.as_ref().map(|p| resolve_against(&output_dir, p));
             out.push(ResolvedJob {
                 ecosystem,
                 input,
                 output,
+                output_dir: output_dir.clone(),
                 all_versions: job.all_versions,
                 targets: job.targets,
                 nodes: job.nodes,
@@ -376,6 +373,28 @@ all_versions = true
         let jobs = cfg.resolve_jobs(&cfg_path).unwrap();
         assert_eq!(jobs.len(), 1);
         assert!(jobs[0].all_versions);
-        assert!(jobs[0].output.ends_with("all.zip"));
+        assert_eq!(
+            jobs[0]
+                .output
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str()),
+            Some("all.zip")
+        );
+    }
+
+    #[test]
+    fn auto_output_when_omitted() {
+        let text = r#"
+ecosystem = "go"
+input = "mods.txt"
+"#;
+        let cfg: DownloadConfigFile = toml::from_str(text).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("download.config");
+        std::fs::write(&cfg_path, text).unwrap();
+        let jobs = cfg.resolve_jobs(&cfg_path).unwrap();
+        assert!(jobs[0].output.is_none());
+        assert_eq!(jobs[0].output_dir, tmp.path());
     }
 }

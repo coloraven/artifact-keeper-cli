@@ -30,6 +30,7 @@ pub async fn download_pypi(
     catalog: Option<Arc<super::catalog::ServerCatalog>>,
     jobs: usize,
     format: &OutputFormat,
+    auto_name: bool,
 ) -> Result<()> {
     if all_versions {
         if (!platforms.is_empty() || !pythons.is_empty())
@@ -74,6 +75,7 @@ pub async fn download_pypi(
             catalog,
             jobs,
             format: format.clone(),
+            auto_name,
         },
     )
     .await

@@ -109,7 +109,7 @@ ak download --pypi requirements.txt -o ak-ferry-pypi.zip
 ak download --cargo Cargo.toml -o ak-ferry-cargo.zip
 
 # Skip packages already on the intranet server (copy catalog from intranet first):
-#   ak download catalog npm-local -o ak-catalog.jsonl
+#   ak repo catalog npm-local -o ak-catalog.jsonl
 ak download --npm package.json --catalog ak-catalog.jsonl -o ak-ferry-npm.zip
 ak download --npm package.json --all-versions -o ak-ferry-npm-all.zip
 ak download --npm package.json --target linux-x64 --target darwin-arm64 --target win32-x64

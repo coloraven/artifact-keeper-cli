@@ -3,7 +3,7 @@
 #    or: copy to ./download.config and run `ak download`
 #
 # Intranet → internet workflow:
-#   1) ak download catalog npm-local -o ak-catalog.jsonl
+#   1) ak repo catalog npm-local -o ak-catalog.jsonl
 #   2) copy ak-catalog.jsonl to the internet host
 #   3) ak download --npm package.json --catalog ak-catalog.jsonl
 

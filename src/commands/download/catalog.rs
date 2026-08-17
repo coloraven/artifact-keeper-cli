@@ -1,4 +1,7 @@
 //! Server repository catalog: export from AK API + load for ferry skip.
+//!
+//! CLI export entry point: `ak repo catalog <repo>`.
+//! Ferry download consumes the JSONL via `ak download --catalog <file>`.
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};

@@ -118,6 +118,8 @@ pub struct FerryOpts {
     pub catalog: Option<Arc<ServerCatalog>>,
     pub jobs: usize,
     pub format: OutputFormat,
+    /// When true, append `-r{n}-m{m}` to the zip filename after packing.
+    pub auto_name: bool,
 }
 
 /// One scheduled fetch unit (usually one root; npm may expand to root×target×node).
@@ -397,6 +399,7 @@ pub async fn run_ferry(
         manifest.modules.len(),
         &unit_errors,
         &opts.format,
+        opts.auto_name,
     )
 }
 
@@ -411,28 +414,35 @@ pub fn finish_ferry(
     modules_len: usize,
     unit_errors: &[UnitError],
     format: &OutputFormat,
+    auto_name: bool,
 ) -> Result<()> {
+    let final_output = if auto_name {
+        super::naming::append_stats(output, roots_len, modules_len)
+    } else {
+        output.to_path_buf()
+    };
+
     if !matches!(*format, OutputFormat::Quiet) {
         eprintln!(
             "Packing {} {} version(s) -> {}",
             modules_len,
             ecosystem,
-            output.display()
+            final_output.display()
         );
     }
-    zip_dir(payload, output)?;
+    zip_dir(payload, &final_output)?;
     // Zip is on disk — drop payload + toolchain caches so the host env stays clean.
     cleanup_job_work(work, format);
 
     if matches!(*format, OutputFormat::Quiet) {
-        println!("{}", output.display());
+        println!("{}", final_output.display());
     } else {
         eprintln!(
             "Wrote {} ({} roots, {} packages). Upload with:\n  ak artifact push <{push_repo_hint}-repo> --from-archive {}",
-            output.display(),
+            final_output.display(),
             roots_len,
             modules_len,
-            output.display()
+            final_output.display()
         );
     }
 
