@@ -20,8 +20,12 @@ cargo clippy --workspace -- -D warnings -A dead_code
 # Test
 cargo test --workspace
 
-# Release build (LTO, stripped)
+# Release build (LTO, stripped) — local Windows debug only
 cargo build --release
+
+# Prefer CI release binaries (feat/** / fix/** push or workflow_dispatch):
+#   .github/workflows/build-cli-binaries.yml → ak-windows-amd64 / ak-linux-amd64
+# Download via HTTPS_PROXY=http://127.0.0.1:10811 (see .cursor/rules/github-actions-build.mdc)
 
 # Regenerate SDK from OpenAPI spec
 cargo run -p xtask -- generate

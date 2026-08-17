@@ -1,0 +1,56 @@
+---
+description: Prefer GitHub Actions for CLI/server release binaries; download via 10811 proxy
+alwaysApply: true
+---
+
+# GitHub Actions 编译与本机下载
+
+本机在中国大陆，且 Windows 交叉编译 Linux（openssl-sys 等）成本高；registry 内存也不足以本机 release 编译。**默认用 GitHub Actions 产出可部署二进制**，不要在本机或 registry 上硬编 Linux 服务端。
+
+## 仓库与产物
+
+| 仓库 | Workflow | 产物 artifact 名 | 用途 |
+|------|----------|------------------|------|
+| `artifact-keeper` | `Build Release Binaries` (`.github/workflows/build-linux-binary.yml`，**UBI9 容器内编译**) | `artifact-keeper-linux-amd64` | 替换 registry 容器内 `/usr/local/bin/artifact-keeper`（勿用 ubuntu-latest 裸编，glibc 不兼容 UBI9） |
+| `artifact-keeper-cli` | `Build CLI Binaries` (`.github/workflows/build-cli-binaries.yml`) | `ak-windows-amd64` / `ak-linux-amd64` | 本机联调用 `ak.exe` |
+
+触发：`workflow_dispatch`，或 push 到 `feat/**` / `fix/**`（无需额外为触发申请 token；`git push` 即可）。
+
+## 下载（必须走本机 10811 代理）
+
+```bash
+export HTTPS_PROXY=http://127.0.0.1:10811
+export HTTP_PROXY=http://127.0.0.1:10811
+
+# 用 git credential / GH_TOKEN 鉴权后拉取 Actions artifact zip
+# 例：https://api.github.com/repos/<owner>/<repo>/actions/artifacts/<id>/zip
+curl -fsSL -L -x http://127.0.0.1:10811 \
+  -H "Authorization: Bearer $GH_TOKEN" \
+  -H "Accept: application/vnd.github+json" \
+  -o artifact.zip \
+  "https://api.github.com/repos/<owner>/<repo>/actions/artifacts/<id>/zip"
+```
+
+或：
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:10811 HTTP_PROXY=http://127.0.0.1:10811 \
+  gh run download <run-id> -R <owner>/<repo> -n <artifact-name>
+```
+
+下载后校验 sha256（UI 上显示的往往是 **artifact zip** 的摘要，不一定是解压后的 ELF）。
+
+## 部署到 registry（server）
+
+```bash
+scp artifact-keeper-linux-amd64 registry:/tmp/artifact-keeper
+ssh registry 'docker cp /tmp/artifact-keeper artifact-keeper-backend:/usr/local/bin/artifact-keeper && docker restart artifact-keeper-backend'
+```
+
+入口：`http://127.0.0.1:30080`。
+
+## Agent 行为
+
+1. 改完需要联调的代码 → commit + push 到 `feat/**`，等 Actions 绿。
+2. 用 **10811 代理**下载 artifact，再部署/替换本机 `ak`。
+3. 仅在改动极小、且目标就是本机 Windows 开发调试时，才本机 `cargo build` CLI；**不要**在本机 zig/cross 编 Linux server。

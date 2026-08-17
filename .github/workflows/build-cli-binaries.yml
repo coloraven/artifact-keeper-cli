@@ -1,0 +1,90 @@
+# Build ak CLI release binaries for deploy / 联调 (prefer CI over local compile).
+#
+# Triggers: manual dispatch, or push to feat/** / fix/** branches.
+# Download artifacts via local proxy: HTTPS_PROXY=http://127.0.0.1:10811
+
+name: Build CLI Binaries
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "feat/**"
+      - "fix/**"
+    paths-ignore:
+      - "**/*.md"
+      - ".specstory/**"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: build-cli-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ak ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-amd64
+            bin: ak.exe
+            artifact: ak-windows-amd64.exe
+          - os: ubuntu-latest
+            name: linux-amd64
+            bin: ak
+            artifact: ak-linux-amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-${{ matrix.name }}
+
+      - name: Build release
+        run: cargo build --release --bin ak
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+          cd dist
+          sha256sum "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
+          ls -lh
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+          chmod +x "dist/${{ matrix.artifact }}"
+          cd dist
+          tar -czvf "${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
+          sha256sum "${{ matrix.artifact }}" "${{ matrix.artifact }}.tar.gz" \
+            | tee "${{ matrix.artifact }}.sha256"
+          ls -lh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ak-${{ matrix.name }}
+          path: dist/**
+          if-no-files-found: error
+          retention-days: 14
