@@ -25,6 +25,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
 
 jobs:
   build:
@@ -50,6 +52,16 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo (registry + target)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          shared-key: release-cli-${{ matrix.name }}
+          prefix-key: cli-v1
+          cache-targets: true
+          cache-all-crates: true
+          cache-on-failure: true
 
       - name: Build release
         run: cargo build --release --bin ak
