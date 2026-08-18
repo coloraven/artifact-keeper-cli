@@ -1,11 +1,11 @@
 ---
-description: FORBIDDEN — never cargo/rustc compile on this machine or registry; GitHub Actions only
+description: FORBIDDEN — never cargo/rustc compile on this machine or the Linux AMD64 deploy host; GitHub Actions only
 alwaysApply: true
 ---
 
 # 禁止本机编译（第一优先级）
 
-本机磁盘不够。**禁止**在本机、registry、或任何本地 shell 编译本仓库及 `artifact-keeper` 服务端。
+本机磁盘不够。**禁止**在本机、Linux AMD64 部署机、或任何本地 shell 编译本仓库及 `artifact-keeper` 服务端。
 
 ## 禁止（任何理由都不例外）
 
