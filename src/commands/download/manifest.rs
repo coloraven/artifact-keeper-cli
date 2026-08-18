@@ -303,4 +303,28 @@ bare-module
         let reloaded = FerryManifest::load_or_create(tmp.path(), "go", vec![]).unwrap();
         assert_eq!(reloaded.modules.len(), 1);
     }
+
+    #[test]
+    fn module_files_intact_checks_sha_and_deletes_bad() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("pkg.tgz");
+        std::fs::write(&f, b"hello").unwrap();
+        let (sha, size) = sha256_file(&f).unwrap();
+        let entry = FileEntry {
+            relpath: "pkg.tgz".into(),
+            sha256: sha.clone(),
+            size,
+        };
+        assert!(module_files_intact(tmp.path(), &[entry.clone()]));
+        std::fs::write(&f, b"nope").unwrap();
+        assert!(!module_files_intact(
+            tmp.path(),
+            &[FileEntry {
+                relpath: "pkg.tgz".into(),
+                sha256: sha,
+                size,
+            }]
+        ));
+        assert!(!f.is_file());
+    }
 }
