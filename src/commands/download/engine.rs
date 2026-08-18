@@ -20,7 +20,10 @@ use super::cache::DownloadCache;
 use super::catalog::ServerCatalog;
 use super::config::UpstreamConfig;
 use super::errors::{print_error_summary, UnitError};
-use super::manifest::{file_entry, FerryManifest, ModuleEntry, RootSpec};
+use super::manifest::{
+    file_entry, module_files_intact, FerryManifest, ModuleEntry, RootSpec, MANIFEST_JSON,
+    MANIFEST_JSONL,
+};
 use super::pack::{copy_dir_tree, zip_dir};
 use super::parallel;
 use crate::error::AkError;
@@ -289,6 +292,15 @@ pub async fn run_ferry(
     // expansion and fetches never touch the user’s global caches.
     let dirs = WorkDirs::create(work, tool.artifact_subdir(), tool.tool_cache_subdir())?;
 
+    // `--no-archive` resume: if -o already holds a ferry tree, seed the payload so
+    // intact modules can be skipped without relying solely on the SQLite cache.
+    if opts.no_archive
+        && output.is_dir()
+        && (output.join(MANIFEST_JSON).is_file() || output.join(MANIFEST_JSONL).is_file())
+    {
+        copy_dir_tree(output, &dirs.payload)?;
+    }
+
     let log = LogMode::resolve(&opts.format, opts.verbose);
     let detail_format = if log.detail() {
         opts.format.clone()
@@ -324,11 +336,25 @@ pub async fn run_ferry(
 
     let mut manifest =
         FerryManifest::load_or_create(&dirs.payload, tool.ecosystem(), roots.clone())?;
-    let mut known: HashSet<(String, String)> = manifest
-        .modules
-        .iter()
-        .map(|m| (m.name.clone(), m.version.clone()))
-        .collect();
+    let prior_count = manifest.modules.len();
+    let mut known: HashSet<(String, String)> = HashSet::new();
+    let mut intact_modules = Vec::new();
+    for m in std::mem::take(&mut manifest.modules) {
+        if module_files_intact(&dirs.payload, &m.files) {
+            known.insert((m.name.clone(), m.version.clone()));
+            intact_modules.push(m);
+        }
+    }
+    manifest.modules = intact_modules;
+    if manifest.modules.len() != prior_count {
+        let _ = manifest.save(&dirs.payload);
+    }
+    if !known.is_empty() && !matches!(log, LogMode::Quiet) {
+        eprintln!(
+            "Resuming download: {} package(s) already intact under payload",
+            known.len()
+        );
+    }
     let mut unit_errors: Vec<UnitError> = Vec::new();
 
     let passes = tool.expand_passes(roots.clone());

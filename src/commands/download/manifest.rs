@@ -146,6 +146,39 @@ pub fn file_entry(payload_root: &Path, abs: &Path) -> Result<FileEntry> {
     })
 }
 
+/// True when every listed file exists under `payload_root` with matching size and sha256.
+/// On mismatch, deletes the bad file so the next fetch can rewrite it.
+pub fn module_files_intact(payload_root: &Path, files: &[FileEntry]) -> bool {
+    if files.is_empty() {
+        return false;
+    }
+    for f in files {
+        let path = join_rel(payload_root, &f.relpath);
+        if !path.is_file() {
+            return false;
+        }
+        match sha256_file(&path) {
+            Ok((sha, size)) if sha == f.sha256 && size == f.size => {}
+            _ => {
+                let _ = std::fs::remove_file(&path);
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn join_rel(root: &Path, rel: &str) -> PathBuf {
+    let mut p = root.to_path_buf();
+    for part in rel.replace('\\', "/").split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        p.push(part);
+    }
+    p
+}
+
 /// Parse `name@version` / `name version` / bare name lines; `#` comments; blank skip.
 /// Scoped npm packages: `@scope/name`, `@scope/name@version`, or `@scope/name 1.2.3`.
 pub fn parse_module_list(text: &str) -> Vec<RootSpec> {
