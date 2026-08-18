@@ -1,0 +1,27 @@
+---
+description: FORBIDDEN — never cargo/rustc compile on this machine or registry; GitHub Actions only
+alwaysApply: true
+---
+
+# 禁止本机编译（第一优先级）
+
+本机磁盘不够。**禁止**在本机、registry、或任何本地 shell 编译本仓库及 `artifact-keeper` 服务端。
+
+## 禁止（任何理由都不例外）
+
+- `cargo build` / `cargo test` / `cargo clippy` / `cargo run` / `rustc` / `rustup` 装 toolchain
+- `--release`、debug、`--bin ak`、`--lib`、xtask generate 触发的编译
+- 交叉编译、zig、cross、docker 里本机编 Linux
+- 「改动很小」「只跑单测」「Windows 调试」——全部禁止
+- 为跑测试而编译；单测跟二进制一样走 CI
+
+## 必须
+
+1. 改完代码 → **commit + push 到 `feat/**` 或 `fix/**`**（或 `workflow_dispatch`）
+2. 等 GitHub Actions 绿
+3. 用 `HTTPS_PROXY=http://127.0.0.1:10811` 下载 artifact，替换 `dist/ak.exe` / 部署 server
+
+CLI：`ak-windows-amd64` / `ak-linux-amd64`  
+Server：`artifact-keeper-linux-amd64`（UBI9 workflow）
+
+若已误在本机编过：立刻停掉 cargo，删除 `target/`，不要再编。

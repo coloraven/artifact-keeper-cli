@@ -291,37 +291,9 @@ async fn push(
         .await;
     }
 
-    // Go module proxy / download-cache tree → protocol PUT /go/{repo}/…
-    if let Some(dir) = from_dir
-        && super::go_proxy::looks_like_go_proxy_cache(dir)
-    {
-        if target_path.is_some() {
-            return Err(AkError::ConfigError(
-                "--path is not supported with Go module proxy cache uploads (module paths come from the tree)".into(),
-            )
-            .into());
-        }
-        let (uploaded, skipped) = super::go_proxy::push_go_proxy_cache(
-            &base_url,
-            &auth_header,
-            repo,
-            dir,
-            skip_dupe_uploads,
-            &global.format,
-        )
-        .await?;
-        if !matches!(global.format, OutputFormat::Quiet) {
-            if skip_dupe_uploads {
-                eprintln!("Done: uploaded {uploaded} module(s), skipped {skipped} dupe(s).");
-            } else {
-                eprintln!("Uploaded {uploaded} Go module version(s).");
-            }
-        }
-        return Ok(());
-    }
-
-    // `ak download --no-archive` tree: npm/pypi/cargo protocol paths (go uses
-    // the proxy-cache branch above when `download/` is present).
+    // `ak download --no-archive` tree must win over GOPROXY detection: the
+    // pack contains `download/<module>/@v/...`, which would otherwise be
+    // uploaded as module `download/github.com/...` and 404 on GOPROXY.
     if let Some(dir) = from_dir
         && let Some(plan) = super::ferry_dir::plan_ferry_push(dir)?
     {
@@ -377,6 +349,35 @@ async fn push(
             global,
         )
         .await;
+    }
+
+    // Bare Go module proxy / download-cache tree → protocol PUT /go/{repo}/…
+    if let Some(dir) = from_dir
+        && super::go_proxy::looks_like_go_proxy_cache(dir)
+    {
+        if target_path.is_some() {
+            return Err(AkError::ConfigError(
+                "--path is not supported with Go module proxy cache uploads (module paths come from the tree)".into(),
+            )
+            .into());
+        }
+        let (uploaded, skipped) = super::go_proxy::push_go_proxy_cache(
+            &base_url,
+            &auth_header,
+            repo,
+            dir,
+            skip_dupe_uploads,
+            &global.format,
+        )
+        .await?;
+        if !matches!(global.format, OutputFormat::Quiet) {
+            if skip_dupe_uploads {
+                eprintln!("Done: uploaded {uploaded} module(s), skipped {skipped} dupe(s).");
+            } else {
+                eprintln!("Uploaded {uploaded} Go module version(s).");
+            }
+        }
+        return Ok(());
     }
 
     let items = collect_upload_items(file_patterns, from_dir, target_path)?;

@@ -1,11 +1,11 @@
 ---
-description: Prefer GitHub Actions for CLI/server release binaries; download via 10811 proxy
+description: GitHub Actions is the ONLY compiler; download binaries via 10811 proxy
 alwaysApply: true
 ---
 
 # GitHub Actions 编译与本机下载
 
-本机在中国大陆，且 Windows 交叉编译 Linux（openssl-sys 等）成本高；registry 内存也不足以本机 release 编译。**默认用 GitHub Actions 产出可部署二进制**，不要在本机或 registry 上硬编 Linux 服务端。
+本机磁盘不足。编译规则见 `no-local-compile.mdc`（第一优先级、无例外）。本文件只写 **Actions 产物怎么下、怎么部署**。
 
 ## 仓库与产物
 
@@ -51,6 +51,6 @@ ssh registry 'docker cp /tmp/artifact-keeper artifact-keeper-backend:/usr/local/
 
 ## Agent 行为
 
-1. 改完需要联调的代码 → commit + push 到 `feat/**`，等 Actions 绿。
-2. 用 **10811 代理**下载 artifact，再部署/替换本机 `ak`。
-3. 仅在改动极小、且目标就是本机 Windows 开发调试时，才本机 `cargo build` CLI；**不要**在本机 zig/cross 编 Linux server。
+1. **禁止**本机 `cargo` / `rustc`（含 debug、test、clippy）。
+2. 改完需要联调的代码 → commit + push 到 `feat/**`，等 Actions 绿。
+3. 用 **10811 代理**下载 artifact，再部署/替换本机 `ak`。

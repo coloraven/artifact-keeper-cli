@@ -351,6 +351,27 @@ mod tests {
     }
 
     #[test]
+    fn scan_from_ferry_root_prefixes_download() {
+        // Trap: scanning the --no-archive ferry root (not download/) yields
+        // module path `download/github.com/...`. Dispatch must prefer ferry.
+        let tmp = tempfile::tempdir().unwrap();
+        let vdir = tmp
+            .path()
+            .join("download")
+            .join("github.com")
+            .join("rs")
+            .join("xid")
+            .join("@v");
+        std::fs::create_dir_all(&vdir).unwrap();
+        std::fs::write(vdir.join("v1.5.0.zip"), b"zip").unwrap();
+        std::fs::write(vdir.join("v1.5.0.mod"), b"module github.com/rs/xid\n").unwrap();
+        let rooted_at_ferry = scan_go_proxy_cache(tmp.path()).unwrap();
+        assert_eq!(rooted_at_ferry[0].module_encoded, "download/github.com/rs/xid");
+        let rooted_at_download = scan_go_proxy_cache(&tmp.path().join("download")).unwrap();
+        assert_eq!(rooted_at_download[0].module_encoded, "github.com/rs/xid");
+    }
+
+    #[test]
     fn scan_ignores_plain_trees() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("a.whl"), b"x").unwrap();

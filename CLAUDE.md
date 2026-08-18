@@ -6,32 +6,12 @@
 
 ## Build & Development Commands
 
+**禁止本机 `cargo build` / `test` / `clippy` / `run` / xtask 编译。** 磁盘不够；见 `.cursor/rules/no-local-compile.mdc`。
+
 ```bash
-# Build
-cargo build
-
-# Run
-cargo run -- --help
-
-# Lint
-cargo fmt --check
-cargo clippy --workspace -- -D warnings -A dead_code
-
-# Test
-cargo test --workspace
-
-# Release build (LTO, stripped) — local Windows debug only
-cargo build --release
-
-# Prefer CI release binaries (feat/** / fix/** push or workflow_dispatch):
-#   .github/workflows/build-cli-binaries.yml → ak-windows-amd64 / ak-linux-amd64
-# Download via HTTPS_PROXY=http://127.0.0.1:10811 (see .cursor/rules/github-actions-build.mdc)
-
-# Regenerate SDK from OpenAPI spec
-cargo run -p xtask -- generate
-
-# Verify SDK is up-to-date
-cargo run -p xtask -- generate --check
+# 唯一出二进制路径：push feat/** 或 workflow_dispatch
+# .github/workflows/build-cli-binaries.yml → ak-windows-amd64 / ak-linux-amd64
+# 下载必须 HTTPS_PROXY=http://127.0.0.1:10811（见 .cursor/rules/github-actions-build.mdc）
 ```
 
 ## Architecture
