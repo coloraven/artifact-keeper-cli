@@ -1,7 +1,6 @@
 //! Cargo / crates.io ferry download: isolated `cargo fetch` or direct `.crate` fetch.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -553,40 +552,106 @@ fn download_crate_file(
     std::fs::create_dir_all(&dest_dir)
         .map_err(|e| AkError::ConfigError(format!("mkdir {}: {e}", dest_dir.display())))?;
     let dest = dest_dir.join(format!("{name}-{version}.crate"));
+    let mut partial_os = dest.as_os_str().to_owned();
+    partial_os.push(".partial");
+    let partial = PathBuf::from(partial_os);
 
     let client = reqwest::blocking::Client::builder()
         .user_agent("artifact-keeper-cli/ak-download")
         .build()
         .map_err(|e| AkError::ConfigError(format!("http client: {e}")))?;
-    let mut resp = client
-        .get(&url)
-        .send()
-        .map_err(|e| AkError::ConfigError(format!("GET {url}: {e}")))?;
-    if !resp.status().is_success() {
+
+    download_url_resumable(&client, &url, &partial, &dest).or_else(|e| {
         // Fallback to crates.io static CDN.
         let fallback = format!(
             "https://static.crates.io/crates/{name}/{name}-{version}.crate"
         );
-        resp = client
-            .get(&fallback)
-            .send()
-            .map_err(|e| AkError::ConfigError(format!("GET {fallback}: {e}")))?;
-        if !resp.status().is_success() {
-            return Err(AkError::ConfigError(format!(
-                "download {name}@{version} failed: HTTP {} ({url})",
-                resp.status()
-            ))
-            .into());
-        }
-    }
-    let bytes = resp
-        .bytes()
-        .map_err(|e| AkError::ConfigError(format!("read body: {e}")))?;
-    let mut f = std::fs::File::create(&dest)
-        .map_err(|e| AkError::ConfigError(format!("write {}: {e}", dest.display())))?;
-    f.write_all(&bytes)
-        .map_err(|e| AkError::ConfigError(format!("write {}: {e}", dest.display())))?;
+        download_url_resumable(&client, &fallback, &partial, &dest).map_err(|_| e)
+    })?;
     Ok(dest)
+}
+
+/// Download `url` into `partial`, using HTTP Range when a partial already exists.
+/// On success, renames `partial` → `dest`. Cache must only be written after this returns.
+fn download_url_resumable(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    partial: &Path,
+    dest: &Path,
+) -> Result<()> {
+    let existing = if partial.is_file() {
+        std::fs::metadata(partial)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let mut req = client.get(url);
+    if existing > 0 {
+        req = req.header(
+            reqwest::header::RANGE,
+            format!("bytes={existing}-"),
+        );
+    }
+
+    let mut resp = req
+        .send()
+        .map_err(|e| AkError::ConfigError(format!("GET {url}: {e}")))?;
+    let status = resp.status();
+
+    let append = if existing > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT {
+        true
+    } else if status.is_success() {
+        // Full body (Range ignored or fresh download). Restart partial if needed.
+        if existing > 0 {
+            let _ = std::fs::remove_file(partial);
+        }
+        false
+    } else {
+        return Err(AkError::ConfigError(format!(
+            "download failed: HTTP {status} ({url})"
+        ))
+        .into());
+    };
+
+    use std::io::{Read, Write};
+    let mut file = if append {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(partial)
+            .map_err(|e| AkError::ConfigError(format!("open {}: {e}", partial.display())))?
+    } else {
+        std::fs::File::create(partial)
+            .map_err(|e| AkError::ConfigError(format!("create {}: {e}", partial.display())))?
+    };
+
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = resp
+            .read(&mut buf)
+            .map_err(|e| AkError::ConfigError(format!("read body {url}: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n])
+            .map_err(|e| AkError::ConfigError(format!("write {}: {e}", partial.display())))?;
+    }
+    file.sync_all()
+        .map_err(|e| AkError::ConfigError(format!("sync {}: {e}", partial.display())))?;
+    drop(file);
+
+    if dest.exists() {
+        let _ = std::fs::remove_file(dest);
+    }
+    std::fs::rename(partial, dest).map_err(|e| {
+        AkError::ConfigError(format!(
+            "rename {} -> {}: {e}",
+            partial.display(),
+            dest.display()
+        ))
+    })?;
+    Ok(())
 }
 
 fn restore_cargo_closure(

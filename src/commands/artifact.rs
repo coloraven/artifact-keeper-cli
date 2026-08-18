@@ -426,6 +426,25 @@ async fn push_items(
     let mut uploaded = 0usize;
     let mut skipped = 0usize;
 
+    if let Some(ref remote) = remote_checksums {
+        let mut already = 0usize;
+        for item in items {
+            let local_sha = super::chunked_upload::sha256_file(&item.local_path).await?;
+            if remote
+                .get(&item.artifact_path)
+                .is_some_and(|sha| sha == &local_sha)
+            {
+                already += 1;
+            }
+        }
+        let pending = items.len().saturating_sub(already);
+        if already > 0 && !matches!(global.format, OutputFormat::Quiet) {
+            eprintln!(
+                "Resuming: skipped {already} already on server, uploading {pending}…"
+            );
+        }
+    }
+
     for item in items {
         let file_path = &item.local_path;
         let artifact_path = &item.artifact_path;
@@ -499,22 +518,34 @@ async fn push_items(
             });
             let body = reqwest::Body::wrap_stream(stream);
 
-            let resp =
-                single_put_upload(&base_url, &auth_header, repo, artifact_path, body).await?;
+            match single_put_upload(&base_url, &auth_header, repo, artifact_path, body).await {
+                Ok(resp) => {
+                    pb.finish_with_message(format!("Uploaded {file_name}"));
+                    uploaded += 1;
 
-            pb.finish_with_message(format!("Uploaded {file_name}"));
-            uploaded += 1;
-
-            if matches!(global.format, OutputFormat::Quiet) {
-                println!("{}", resp.path);
-            } else {
-                eprintln!(
-                    "  {} ({}) -> {}:{}",
-                    file_name,
-                    format_bytes(resp.size_bytes),
-                    repo,
-                    resp.path
-                );
+                    if matches!(global.format, OutputFormat::Quiet) {
+                        println!("{}", resp.path);
+                    } else {
+                        eprintln!(
+                            "  {} ({}) -> {}:{}",
+                            file_name,
+                            format_bytes(resp.size_bytes),
+                            repo,
+                            resp.path
+                        );
+                    }
+                }
+                Err(e) if skip_dupe_uploads && is_upload_conflict(&e) => {
+                    pb.abandon_with_message(format!("Skipped {file_name} (already exists)"));
+                    skipped += 1;
+                    if !matches!(global.format, OutputFormat::Quiet) {
+                        eprintln!("  skip conflict: {artifact_path}");
+                    }
+                }
+                Err(e) => {
+                    pb.abandon_with_message(format!("Failed {file_name}"));
+                    return Err(e);
+                }
             }
         }
     }
@@ -528,6 +559,16 @@ async fn push_items(
     }
 
     Ok(())
+}
+
+/// True when the server rejected an upload because the artifact already exists
+/// (HTTP 409 / immutable path). Safe to treat as skip under `--skip-dupe-uploads`.
+fn is_upload_conflict(err: &miette::Report) -> bool {
+    let msg = format!("{err:#}").to_lowercase();
+    msg.contains("409")
+        || msg.contains("conflict")
+        || msg.contains("immutable")
+        || msg.contains("already exists")
 }
 
 #[derive(Debug, Clone)]

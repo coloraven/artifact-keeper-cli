@@ -175,7 +175,38 @@ pub async fn go_version_exists(
     module_encoded: &str,
     version: &str,
 ) -> Result<bool> {
-    let url = go_module_url(base_url, repo, module_encoded, version, "mod")?;
+    let p = go_version_presence(base_url, auth_header, repo, module_encoded, version).await?;
+    Ok(p.mod_file && p.zip)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GoRemotePresence {
+    pub zip: bool,
+    pub mod_file: bool,
+}
+
+/// HEAD `.zip` and `.mod` to see which sides of a module version are already on the server.
+pub async fn go_version_presence(
+    base_url: &str,
+    auth_header: &str,
+    repo: &str,
+    module_encoded: &str,
+    version: &str,
+) -> Result<GoRemotePresence> {
+    let mod_file = go_head_ok(base_url, auth_header, repo, module_encoded, version, "mod").await?;
+    let zip = go_head_ok(base_url, auth_header, repo, module_encoded, version, "zip").await?;
+    Ok(GoRemotePresence { zip, mod_file })
+}
+
+async fn go_head_ok(
+    base_url: &str,
+    auth_header: &str,
+    repo: &str,
+    module_encoded: &str,
+    version: &str,
+    suffix: &str,
+) -> Result<bool> {
+    let url = go_module_url(base_url, repo, module_encoded, version, suffix)?;
     let resp = super::client::raw_http_client()?
         .head(url)
         .header(reqwest::header::AUTHORIZATION, auth_header)
@@ -217,45 +248,60 @@ async fn put_go_bytes(
 }
 
 /// Upload one Go module version (zip + mod) via the proxy protocol.
+/// When `only_missing` is set, skip sides that are already present remotely.
 pub async fn push_go_module(
     base_url: &str,
     auth_header: &str,
     repo: &str,
     module: &GoModuleVersion,
 ) -> Result<()> {
-    let zip_bytes = tokio::fs::read(&module.zip_path)
-        .await
-        .map_err(|e| AkError::ConfigError(format!("Read {}: {e}", module.zip_path.display())))?;
-    let mod_bytes = tokio::fs::read(&module.mod_path)
-        .await
-        .map_err(|e| AkError::ConfigError(format!("Read {}: {e}", module.mod_path.display())))?;
+    push_go_module_parts(base_url, auth_header, repo, module, true, true).await
+}
 
-    put_go_bytes(
-        base_url,
-        auth_header,
-        repo,
-        &module.module_encoded,
-        &module.version,
-        "zip",
-        "application/zip",
-        zip_bytes,
-    )
-    .await?;
-    put_go_bytes(
-        base_url,
-        auth_header,
-        repo,
-        &module.module_encoded,
-        &module.version,
-        "mod",
-        "text/plain",
-        mod_bytes,
-    )
-    .await?;
+async fn push_go_module_parts(
+    base_url: &str,
+    auth_header: &str,
+    repo: &str,
+    module: &GoModuleVersion,
+    put_zip: bool,
+    put_mod: bool,
+) -> Result<()> {
+    if put_zip {
+        let zip_bytes = tokio::fs::read(&module.zip_path).await.map_err(|e| {
+            AkError::ConfigError(format!("Read {}: {e}", module.zip_path.display()))
+        })?;
+        put_go_bytes(
+            base_url,
+            auth_header,
+            repo,
+            &module.module_encoded,
+            &module.version,
+            "zip",
+            "application/zip",
+            zip_bytes,
+        )
+        .await?;
+    }
+    if put_mod {
+        let mod_bytes = tokio::fs::read(&module.mod_path).await.map_err(|e| {
+            AkError::ConfigError(format!("Read {}: {e}", module.mod_path.display()))
+        })?;
+        put_go_bytes(
+            base_url,
+            auth_header,
+            repo,
+            &module.module_encoded,
+            &module.version,
+            "mod",
+            "text/plain",
+            mod_bytes,
+        )
+        .await?;
+    }
     Ok(())
 }
 
-/// Push all Go modules found under `root` using the Go proxy protocol.
+/// Push all Go modules found under `root` using the Go module-proxy protocol.
 pub async fn push_go_proxy_cache(
     base_url: &str,
     auth_header: &str,
@@ -275,6 +321,32 @@ pub async fn push_go_proxy_cache(
 
     let mut uploaded = 0usize;
     let mut skipped = 0usize;
+    let mut pending = 0usize;
+
+    if skip_dupe_uploads && !matches!(format, OutputFormat::Quiet) {
+        // Pre-scan so the resume line is accurate before the first PUT.
+        for module in &modules {
+            let p = go_version_presence(
+                base_url,
+                auth_header,
+                repo,
+                &module.module_encoded,
+                &module.version,
+            )
+            .await?;
+            if p.zip && p.mod_file {
+                skipped += 1;
+            } else {
+                pending += 1;
+            }
+        }
+        if skipped > 0 {
+            eprintln!(
+                "Resuming: skipped {skipped} already on server, uploading {pending}…"
+            );
+        }
+        skipped = 0;
+    }
 
     for module in &modules {
         let display = format!(
@@ -283,25 +355,30 @@ pub async fn push_go_proxy_cache(
             module.version
         );
 
-        if skip_dupe_uploads
-            && go_version_exists(
+        let (put_zip, put_mod) = if skip_dupe_uploads {
+            let p = go_version_presence(
                 base_url,
                 auth_header,
                 repo,
                 &module.module_encoded,
                 &module.version,
             )
-            .await?
-        {
-            skipped += 1;
-            if !matches!(format, OutputFormat::Quiet) {
-                eprintln!("  skip dupe: {display}");
+            .await?;
+            if p.zip && p.mod_file {
+                skipped += 1;
+                if !matches!(format, OutputFormat::Quiet) {
+                    eprintln!("  skip dupe: {display}");
+                }
+                continue;
             }
-            continue;
-        }
+            (!p.zip, !p.mod_file)
+        } else {
+            (true, true)
+        };
 
         let spinner = crate::output::spinner(&format!("Uploading {display} (go protocol)..."));
-        let result = push_go_module(base_url, auth_header, repo, module).await;
+        let result =
+            push_go_module_parts(base_url, auth_header, repo, module, put_zip, put_mod).await;
         spinner.finish_and_clear();
         result?;
 
@@ -309,7 +386,13 @@ pub async fn push_go_proxy_cache(
         if matches!(format, OutputFormat::Quiet) {
             println!("{display}");
         } else {
-            eprintln!("  {display} -> go/{repo}/...");
+            let parts = match (put_zip, put_mod) {
+                (true, true) => "zip+mod",
+                (true, false) => "zip",
+                (false, true) => "mod",
+                (false, false) => unreachable!(),
+            };
+            eprintln!("  {display} -> go/{repo}/... ({parts})");
         }
     }
 

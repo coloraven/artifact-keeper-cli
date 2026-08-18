@@ -361,7 +361,16 @@ pub async fn chunked_upload(
     // Step 5: Finalize (server assembles chunks + creates the artifact; can take
     // a while for large files with no further progress updates).
     eprintln!("Finalizing upload (server assembling chunks)...");
-    let result = finalize_upload(&http, base_url, auth_header, &session_id).await?;
+    let result = match finalize_upload(&http, base_url, auth_header, &session_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            // Keep local session cache so the same push command can resume.
+            eprintln!(
+                "Finalize failed; upload session kept. Re-run the same push command to resume."
+            );
+            return Err(e);
+        }
+    };
 
     // Step 6: Clean up cache
     remove_session_cache(file_path)?;

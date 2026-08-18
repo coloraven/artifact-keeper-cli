@@ -175,11 +175,113 @@ impl DownloadCache {
         if !found {
             return Ok(false);
         }
+        if !self.verify_blobs(key)? {
+            // Corrupt / truncated / interrupted store — drop so the next fetch re-downloads.
+            let _ = self.invalidate(key);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Drop the SQLite row and on-disk blob directory for `key`.
+    pub fn invalidate(&self, key: &CacheKey) -> Result<()> {
         let blob = self.blob_dir_for(key);
-        Ok(blob.is_dir()
-            && std::fs::read_dir(&blob)
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false))
+        if blob.exists() {
+            let _ = std::fs::remove_dir_all(&blob);
+        }
+        self.lock_conn()?
+            .execute(
+                "DELETE FROM downloaded
+                 WHERE ecosystem=?1 AND name=?2 AND version=?3 AND target=?4 AND node=?5",
+                params![
+                    key.ecosystem,
+                    key.name,
+                    key.version,
+                    key.target,
+                    key.node
+                ],
+            )
+            .map_err(|e| AkError::ConfigError(format!("cache invalidate: {e}")))?;
+        Ok(())
+    }
+
+    fn stored_sha256(&self, key: &CacheKey) -> Result<Option<String>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT sha256 FROM downloaded
+                 WHERE ecosystem=?1 AND name=?2 AND version=?3 AND target=?4 AND node=?5",
+            )
+            .map_err(|e| AkError::ConfigError(format!("cache prepare sha: {e}")))?;
+        let mut rows = stmt
+            .query(params![
+                key.ecosystem,
+                key.name,
+                key.version,
+                key.target,
+                key.node
+            ])
+            .map_err(|e| AkError::ConfigError(format!("cache query sha: {e}")))?;
+        match rows.next() {
+            Ok(Some(row)) => {
+                let sha: Option<String> = row
+                    .get(0)
+                    .map_err(|e| AkError::ConfigError(format!("cache sha row: {e}")))?;
+                Ok(sha.filter(|s| !s.is_empty()))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(AkError::ConfigError(format!("cache sha next: {e}")).into()),
+        }
+    }
+
+    /// True when blob files look complete (non-empty, no `*.partial`, sha matches when stored).
+    fn verify_blobs(&self, key: &CacheKey) -> Result<bool> {
+        let blob = self.blob_dir_for(key);
+        if !blob.is_dir() {
+            return Ok(false);
+        }
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(&blob)
+            .map_err(|e| AkError::ConfigError(format!("read {}: {e}", blob.display())))?
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            if name.ends_with(".partial") {
+                return Ok(false);
+            }
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => return Ok(false),
+            };
+            if meta.len() == 0 {
+                return Ok(false);
+            }
+            files.push(path);
+        }
+        if files.is_empty() {
+            return Ok(false);
+        }
+        if let Some(expected) = self.stored_sha256(key)? {
+            let mut matched = false;
+            for path in &files {
+                let (actual, _) = sha256_file(path)?;
+                if actual == expected {
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn blob_dir_for(&self, key: &CacheKey) -> PathBuf {
@@ -198,11 +300,20 @@ impl DownloadCache {
     }
 
     /// Copy cached files into `dest_dir` (must exist). Returns absolute paths written.
+    /// Existing dest files are kept only when their sha256 matches the cached blob.
     pub fn materialize(&self, key: &CacheKey, dest_dir: &Path) -> Result<Vec<PathBuf>> {
         let blob = self.blob_dir_for(key);
         if !blob.is_dir() {
             return Err(AkError::ConfigError(format!(
                 "Cache entry missing blobs at {}",
+                blob.display()
+            ))
+            .into());
+        }
+        if !self.verify_blobs(key)? {
+            let _ = self.invalidate(key);
+            return Err(AkError::ConfigError(format!(
+                "Cache entry corrupt at {}",
                 blob.display()
             ))
             .into());
@@ -219,7 +330,21 @@ impl DownloadCache {
             if !from.is_file() {
                 continue;
             }
-            let to = dest_dir.join(entry.file_name());
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.ends_with(".partial") {
+                continue;
+            }
+            let to = dest_dir.join(&name);
+            if to.is_file() {
+                let (sha_to, _) = sha256_file(&to)?;
+                let (sha_from, _) = sha256_file(&from)?;
+                if sha_to == sha_from {
+                    out.push(to);
+                    continue;
+                }
+                let _ = std::fs::remove_file(&to);
+            }
             std::fs::copy(&from, &to).map_err(|e| {
                 AkError::ConfigError(format!(
                     "cache restore {} -> {}: {e}",
@@ -482,5 +607,48 @@ mod tests {
         assert_eq!(normalize_node_target("v20.11.0"), "20.11.0");
         let nodes = parse_node_list(&["18,20".into(), "18".into()]).unwrap();
         assert_eq!(nodes, vec!["18", "20"]);
+    }
+
+    #[test]
+    fn corrupt_blob_invalidates_contains() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("downloads.sqlite");
+        let cache = DownloadCache::open(&db, false).unwrap();
+        let key = CacheKey::cargo("serde", "1.0.0");
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let crate_path = src_dir.join("serde-1.0.0.crate");
+        std::fs::write(&crate_path, b"good-bytes").unwrap();
+        cache.store(&key, &[crate_path]).unwrap();
+        assert!(cache.should_skip(&key).unwrap());
+
+        // Truncate the cached blob to simulate a crash mid-write.
+        let blob = cache.blob_dir_for(&key);
+        let cached_file = std::fs::read_dir(&blob)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(&cached_file, b"bad").unwrap();
+        assert!(!cache.should_skip(&key).unwrap());
+        assert!(!cache.contains(&key).unwrap());
+    }
+
+    #[test]
+    fn partial_suffix_rejects_contains() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("downloads.sqlite");
+        let cache = DownloadCache::open(&db, false).unwrap();
+        let key = CacheKey::cargo("bitflags", "2.5.0");
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let crate_path = src_dir.join("bitflags-2.5.0.crate");
+        std::fs::write(&crate_path, b"crate-bytes").unwrap();
+        cache.store(&key, &[crate_path]).unwrap();
+
+        let blob = cache.blob_dir_for(&key);
+        std::fs::write(blob.join("leftover.crate.partial"), b"xx").unwrap();
+        assert!(!cache.should_skip(&key).unwrap());
     }
 }

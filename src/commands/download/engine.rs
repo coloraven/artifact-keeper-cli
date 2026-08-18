@@ -566,7 +566,7 @@ pub fn finish_ferry(
         println!("{}", final_output.display());
     } else if no_archive {
         eprintln!(
-            "Wrote {} ({} roots, {} packages). Upload with:\n  ak artifact push <{push_repo_hint}-local> --from-dir {} --skip-dupe-uploads",
+            "Wrote {} ({} roots, {} packages). Re-run the same command to resume skipped packages.\nUpload with:\n  ak artifact push <{push_repo_hint}-local> --from-dir {} --skip-dupe-uploads",
             final_output.display(),
             roots_len,
             modules_len,
