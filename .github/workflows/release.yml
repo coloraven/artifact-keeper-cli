@@ -263,26 +263,40 @@ jobs:
               "$f"
           done
 
+      - name: Compose Chinese release notes
+        run: |
+          set -euo pipefail
+          {
+            echo "# 本发行来源分支：\`feat/airgap-bulk-push\`"
+            echo ""
+            echo "> **coloraven 分叉发行**（非上游 artifact-keeper-cli 官方 Release）。"
+            echo "> 标签：\`${GITHUB_REF_NAME}\`　提交：\`${GITHUB_SHA}\`"
+            echo ""
+            cat RELEASE_NOTES.zh.md
+            echo ""
+            echo "## Verifying signatures"
+            echo ""
+            echo "All release artifacts are signed with [cosign](https://docs.sigstore.dev/cosign/signing/signing_with_blobs/)"
+            echo "(keyless, via the GitHub Actions OIDC identity). Each artifact has a"
+            echo "\`.sig\` (signature) and \`.pem\` (signing certificate) file. To verify a"
+            echo "download, e.g. \`ak-linux-amd64\`:"
+            echo ""
+            echo "\`\`\`sh"
+            echo "cosign verify-blob \\"
+            echo "  --certificate ak-linux-amd64.pem \\"
+            echo "  --signature ak-linux-amd64.sig \\"
+            echo "  --certificate-identity \"https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}\" \\"
+            echo "  --certificate-oidc-issuer \"https://token.actions.githubusercontent.com\" \\"
+            echo "  ak-linux-amd64"
+            echo "\`\`\`"
+          } > release-body.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          body: |
-            ## Verifying signatures
-
-            All release artifacts are signed with [cosign](https://docs.sigstore.dev/cosign/signing/signing_with_blobs/)
-            (keyless, via the GitHub Actions OIDC identity). Each artifact has a
-            `.sig` (signature) and `.pem` (signing certificate) file. To verify a
-            download, e.g. `ak-linux-amd64`:
-
-            ```sh
-            cosign verify-blob \
-              --certificate ak-linux-amd64.pem \
-              --signature ak-linux-amd64.sig \
-              --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}" \
-              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-              ak-linux-amd64
-            ```
+          name: ${{ github.ref_name }}（来源分支 feat/airgap-bulk-push）
+          body_path: release-body.md
           files: |
             artifacts/ak-linux-*
             artifacts/ak-darwin-*
@@ -299,6 +313,7 @@ jobs:
   homebrew:
     name: Update Homebrew Tap
     needs: release
+    if: github.repository_owner == 'artifact-keeper'
     runs-on: ubuntu-latest
     steps:
       - name: Extract version
