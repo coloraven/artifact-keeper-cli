@@ -1,3 +1,11 @@
 /target
 .worktrees/
 .claude/
+.specstory/
+/dist/
+**/login.json
+*.password
+.env
+.env.*
+!.env.example
+_fix_*.py
