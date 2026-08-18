@@ -52,6 +52,72 @@ pub fn zip_dir(staging: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Copy (or rename) `src` directory tree to `dst`. Does not delete `dst` if it
+/// already exists; files are merged on top. Never deletes `src` unless a same-
+/// volume rename succeeds and `dst` did not already exist.
+pub fn copy_dir_tree(src: &Path, dst: &Path) -> Result<()> {
+    if !src.is_dir() {
+        return Err(AkError::ConfigError(format!(
+            "Payload is not a directory: {}",
+            src.display()
+        ))
+        .into());
+    }
+    if src == dst {
+        return Ok(());
+    }
+    if dst.exists() {
+        if dst.is_file() {
+            return Err(AkError::ConfigError(format!(
+                "Output exists as a file (need a directory for --no-archive): {}",
+                dst.display()
+            ))
+            .into());
+        }
+        return copy_recursive(src, dst);
+    }
+    if let Some(parent) = dst.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            AkError::ConfigError(format!("Cannot create {}: {e}", parent.display()))
+        })?;
+    }
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(_) => copy_recursive(src, dst),
+    }
+}
+
+fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst).map_err(|e| {
+        AkError::ConfigError(format!("Cannot create {}: {e}", dst.display()))
+    })?;
+    let entries = std::fs::read_dir(src).map_err(|e| {
+        AkError::ConfigError(format!("Cannot read {}: {e}", src.display()))
+    })?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            copy_recursive(&from, &to)?;
+        } else if meta.is_file() {
+            std::fs::copy(&from, &to).map_err(|e| {
+                AkError::ConfigError(format!(
+                    "Copy {} -> {}: {e}",
+                    from.display(),
+                    to.display()
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn collect_files(root: &Path, current: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     let entries = std::fs::read_dir(current).map_err(|e| {
         AkError::ConfigError(format!("Cannot read {}: {e}", current.display()))
@@ -96,5 +162,20 @@ mod tests {
         }
         assert!(names.iter().any(|n| n == "ak-ferry.json"));
         assert!(names.iter().any(|n| n == "download/x/a.mod"));
+    }
+
+    #[test]
+    fn copy_dir_tree_preserves_layout() {
+        let staging = tempfile::tempdir().unwrap();
+        std::fs::write(staging.path().join("ak-ferry.json"), b"{}").unwrap();
+        let nested = staging.path().join("npm").join("lodash");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("lodash-4.17.21.tgz"), b"tgz").unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        let dest = out.path().join("ferry-out");
+        copy_dir_tree(staging.path(), &dest).unwrap();
+        assert!(dest.join("ak-ferry.json").is_file());
+        assert!(dest.join("npm").join("lodash").join("lodash-4.17.21.tgz").is_file());
     }
 }

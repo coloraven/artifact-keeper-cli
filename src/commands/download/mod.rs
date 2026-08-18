@@ -1,5 +1,6 @@
 //! Offline ferry pack builder: isolate per root module, invoke the language
-//! toolchain, stream a manifest, then zip for `ak artifact push --from-archive`.
+//! toolchain, stream a manifest, then zip (or `--no-archive` directory) for
+//! `ak artifact push --from-archive` / `--from-dir`.
 //!
 //! Parameters can come from CLI flags or a `download.config` TOML plan (preferred
 //! as more ecosystems are added).
@@ -11,7 +12,7 @@ mod config;
 mod engine;
 mod errors;
 mod go;
-mod manifest;
+pub(crate) mod manifest;
 mod naming;
 mod npm;
 mod pack;
@@ -27,6 +28,7 @@ use miette::Result;
 use self::cache::{default_cache_db_path, DownloadCache};
 use self::catalog::ServerCatalog;
 use self::config::{DownloadConfigFile, ResolvedJob, UpstreamConfig, DEFAULT_CONFIG_NAME};
+pub(crate) use self::config::parse_ecosystem;
 use crate::cli::GlobalArgs;
 use crate::error::AkError;
 use crate::output::OutputFormat;
@@ -91,11 +93,20 @@ pub struct DownloadArgs {
     #[arg(long = "catalog", value_name = "FILE")]
     pub catalog: Option<PathBuf>,
 
-    /// Output zip path. When omitted, writes
-    /// `ak-ferry-{ecosystem}-{timestamp}[-opts][-rN-mM].zip` in the current directory
+    /// Output zip path (or directory with `--no-archive`). When omitted, writes
+    /// `ak-ferry-{ecosystem}-{timestamp}[-opts][-rN-mM][.zip]` in the current directory
     /// (or the config `output_dir`).
     #[arg(short, long, value_name = "OUTPUT")]
     pub output: Option<PathBuf>,
+
+    /// Write an unpacked directory tree instead of a zip (for
+    /// `ak artifact push --from-dir`)
+    #[arg(long = "no-archive")]
+    pub no_archive: bool,
+
+    /// Print per-package download detail instead of a progress bar
+    #[arg(short = 'v', long = "verbose")]
+    pub verbose: bool,
 
     /// Keep / reuse work directory during the run (default: temp).
     /// Downloaded modules under this dir are still deleted after the ferry zip is written.
@@ -251,6 +262,7 @@ async fn run_cli_job(
         sumdb: None,
         registry: None,
         options: toml::Table::new(),
+        no_archive: args.no_archive,
     };
     let jobs_n = parallel::resolve_jobs(args.jobs);
     let cache = open_cache(args.cache_db.as_deref(), args.force, &global.format)?;
@@ -264,6 +276,8 @@ async fn run_cli_job(
         &cache,
         catalog.as_ref(),
         jobs_n,
+        args.no_archive,
+        args.verbose,
         global,
     )
     .await
@@ -374,6 +388,8 @@ async fn run_config_plan(
         &cache,
         catalog.as_ref(),
         jobs_n,
+        args.no_archive,
+        args.verbose,
         global,
     )
     .await
@@ -425,6 +441,8 @@ async fn run_jobs(
     cache: &Arc<DownloadCache>,
     catalog: Option<&Arc<ServerCatalog>>,
     jobs_n: usize,
+    cli_no_archive: bool,
+    verbose: bool,
     global: &GlobalArgs,
 ) -> Result<()> {
     let keep_work = work_dir.is_some();
@@ -472,6 +490,7 @@ async fn run_jobs(
             AkError::ConfigError(format!("Cannot create {}: {e}", job_work.display()))
         })?;
 
+        let no_archive = cli_no_archive || job.no_archive;
         let (output, auto_name) = naming::resolve_job_output(
             job.output.as_deref(),
             &job.output_dir,
@@ -480,6 +499,7 @@ async fn run_jobs(
             &job.targets,
             &job.nodes,
             catalog.is_some(),
+            !no_archive,
         );
         if auto_name && !matches!(global.format, OutputFormat::Quiet) {
             eprintln!("auto output: {}", output.display());
@@ -511,6 +531,8 @@ async fn run_jobs(
                     jobs_n,
                     &global.format,
                     auto_name,
+                    no_archive,
+                    verbose,
                 )
                 .await?;
             }
@@ -546,6 +568,8 @@ async fn run_jobs(
                     jobs_n,
                     &global.format,
                     auto_name,
+                    no_archive,
+                    verbose,
                 )
                 .await?;
             }
@@ -575,6 +599,8 @@ async fn run_jobs(
                     jobs_n,
                     &global.format,
                     auto_name,
+                    no_archive,
+                    verbose,
                 )
                 .await?;
             }
@@ -608,6 +634,8 @@ async fn run_jobs(
                     jobs_n,
                     &global.format,
                     auto_name,
+                    no_archive,
+                    verbose,
                 )
                 .await?;
             }
@@ -616,7 +644,7 @@ async fn run_jobs(
 
     if keep_work && !matches!(global.format, OutputFormat::Quiet) {
         eprintln!(
-            "Note: --work-dir {} is only retained as an empty parent; per-job download trees are removed after each zip",
+            "Note: --work-dir {} is only retained as an empty parent; per-job download trees are removed after each output is written",
             work.path().display()
         );
     }

@@ -320,6 +320,65 @@ async fn push(
         return Ok(());
     }
 
+    // `ak download --no-archive` tree: npm/pypi/cargo protocol paths (go uses
+    // the proxy-cache branch above when `download/` is present).
+    if let Some(dir) = from_dir
+        && let Some(plan) = super::ferry_dir::plan_ferry_push(dir)?
+    {
+        if target_path.is_some() {
+            return Err(AkError::ConfigError(
+                "--path is not supported with ferry directory uploads (paths come from the manifest)".into(),
+            )
+            .into());
+        }
+        if let Some(go_root) = plan.go_download_root {
+            let (uploaded, skipped) = super::go_proxy::push_go_proxy_cache(
+                &base_url,
+                &auth_header,
+                repo,
+                &go_root,
+                skip_dupe_uploads,
+                &global.format,
+            )
+            .await?;
+            if !matches!(global.format, OutputFormat::Quiet) {
+                if skip_dupe_uploads {
+                    eprintln!("Done: uploaded {uploaded} module(s), skipped {skipped} dupe(s).");
+                } else {
+                    eprintln!("Uploaded {uploaded} Go module version(s).");
+                }
+            }
+            return Ok(());
+        }
+        let items: Vec<UploadItem> = plan
+            .items
+            .into_iter()
+            .map(|f| UploadItem {
+                local_path: f.local_path,
+                artifact_path: f.artifact_path,
+            })
+            .collect();
+        if !matches!(global.format, OutputFormat::Quiet) {
+            eprintln!(
+                "Ferry dir ({}): uploading {} package file(s) at ingest paths",
+                plan.ecosystem,
+                items.len()
+            );
+        }
+        return push_items(
+            repo,
+            &items,
+            skip_dupe_uploads,
+            &base_url,
+            &auth_header,
+            chunk_size,
+            threshold,
+            no_chunked,
+            global,
+        )
+        .await;
+    }
+
     let items = collect_upload_items(file_patterns, from_dir, target_path)?;
     if items.is_empty() {
         return Err(AkError::ConfigError(

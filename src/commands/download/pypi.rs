@@ -31,6 +31,8 @@ pub async fn download_pypi(
     jobs: usize,
     format: &OutputFormat,
     auto_name: bool,
+    no_archive: bool,
+    verbose: bool,
 ) -> Result<()> {
     if all_versions {
         if (!platforms.is_empty() || !pythons.is_empty())
@@ -76,6 +78,8 @@ pub async fn download_pypi(
             jobs,
             format: format.clone(),
             auto_name,
+            no_archive,
+            verbose,
         },
     )
     .await

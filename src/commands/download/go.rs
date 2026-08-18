@@ -23,6 +23,8 @@ pub async fn download_go(
     jobs: usize,
     format: &OutputFormat,
     auto_name: bool,
+    no_archive: bool,
+    verbose: bool,
 ) -> Result<()> {
     let tool = std::sync::Arc::new(GoToolchain);
     super::engine::run_ferry(
@@ -38,6 +40,8 @@ pub async fn download_go(
             jobs,
             format: format.clone(),
             auto_name,
+            no_archive,
+            verbose,
         },
     )
     .await

@@ -1,7 +1,7 @@
-//! Default ferry zip filenames when `-o` / job `output` is omitted.
+//! Default ferry zip / directory names when `-o` / job `output` is omitted.
 //!
-//! Pattern: `ak-ferry-{ecosystem}-{timestamp}[-{opts}][-r{n}-m{m}].zip`
-//! (no input / package names in the filename).
+//! Pattern: `ak-ferry-{ecosystem}-{timestamp}[-{opts}][-r{n}-m{m}][.zip]`
+//! (no input / package names in the filename). `--no-archive` omits `.zip`.
 
 use std::path::{Path, PathBuf};
 
@@ -105,7 +105,28 @@ pub fn opts_suffix(
     }
 }
 
+/// Filename (no directory): `ak-ferry-{eco}-{ts}[-{opts}][.zip]` (without stats).
+pub fn default_ferry_name(
+    ecosystem: Ecosystem,
+    all_versions: bool,
+    targets: &[String],
+    nodes: &[String],
+    has_catalog: bool,
+    archive: bool,
+) -> String {
+    default_ferry_name_with_ts(
+        ecosystem,
+        &ferry_timestamp_utc(),
+        all_versions,
+        targets,
+        nodes,
+        has_catalog,
+        archive,
+    )
+}
+
 /// Filename (no directory): `ak-ferry-{eco}-{ts}[-{opts}].zip` (without stats).
+#[allow(dead_code)]
 pub fn default_ferry_zip_name(
     ecosystem: Ecosystem,
     all_versions: bool,
@@ -113,14 +134,7 @@ pub fn default_ferry_zip_name(
     nodes: &[String],
     has_catalog: bool,
 ) -> String {
-    default_ferry_zip_name_with_ts(
-        ecosystem,
-        &ferry_timestamp_utc(),
-        all_versions,
-        targets,
-        nodes,
-        has_catalog,
-    )
+    default_ferry_name(ecosystem, all_versions, targets, nodes, has_catalog, true)
 }
 
 pub fn default_ferry_zip_name_with_ts(
@@ -131,39 +145,68 @@ pub fn default_ferry_zip_name_with_ts(
     nodes: &[String],
     has_catalog: bool,
 ) -> String {
+    default_ferry_name_with_ts(
+        ecosystem,
+        timestamp,
+        all_versions,
+        targets,
+        nodes,
+        has_catalog,
+        true,
+    )
+}
+
+pub fn default_ferry_name_with_ts(
+    ecosystem: Ecosystem,
+    timestamp: &str,
+    all_versions: bool,
+    targets: &[String],
+    nodes: &[String],
+    has_catalog: bool,
+    archive: bool,
+) -> String {
     let eco = ecosystem_slug(ecosystem);
     let mut name = format!("ak-ferry-{eco}-{timestamp}");
     if let Some(opts) = opts_suffix(all_versions, targets, nodes, has_catalog, ecosystem) {
         name.push('-');
         name.push_str(&opts);
     }
-    name.push_str(".zip");
+    if archive {
+        name.push_str(".zip");
+    }
     name
 }
 
-/// Insert `-r{roots}-m{modules}` before `.zip` when the path looks like an auto ferry name.
+fn already_has_stats(stem: &str) -> bool {
+    if let Some((_, tail)) = stem.rsplit_once("-r") {
+        if let Some((r, m)) = tail.split_once("-m") {
+            return r.chars().all(|c| c.is_ascii_digit()) && m.chars().all(|c| c.is_ascii_digit());
+        }
+    }
+    false
+}
+
+/// Insert `-r{roots}-m{modules}` (before `.zip` when present) for auto ferry names.
 pub fn append_stats(path: &Path, roots: usize, modules: usize) -> PathBuf {
     let Some(file) = path.file_name().and_then(|s| s.to_str()) else {
         return path.to_path_buf();
     };
-    if !file.starts_with("ak-ferry-") || !file.ends_with(".zip") {
+    if !file.starts_with("ak-ferry-") {
         return path.to_path_buf();
     }
-    let stem = &file[..file.len() - 4];
-    // Avoid double-appending if already present.
-    if stem.contains("-r") && stem.rsplit_once("-m").is_some() {
-        // Heuristic: ends with -rN-mM
-        if let Some((_, tail)) = stem.rsplit_once("-r") {
-            if let Some((r, m)) = tail.split_once("-m") {
-                if r.chars().all(|c| c.is_ascii_digit())
-                    && m.chars().all(|c| c.is_ascii_digit())
-                {
-                    return path.to_path_buf();
-                }
-            }
-        }
+    let (stem, zip_suffix) = if let Some(stem) = file.strip_suffix(".zip") {
+        (stem, true)
+    } else {
+        (file, false)
+    };
+    if already_has_stats(stem) {
+        return path.to_path_buf();
     }
-    let new_name = format!("{stem}-r{roots}-m{modules}.zip");
+    let new_name = if zip_suffix {
+        format!("{stem}-r{roots}-m{modules}.zip")
+    } else {
+        format!("{stem}-r{roots}-m{modules}")
+    };
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join(new_name),
         _ => PathBuf::from(new_name),
@@ -179,11 +222,19 @@ pub fn resolve_job_output(
     targets: &[String],
     nodes: &[String],
     has_catalog: bool,
+    archive: bool,
 ) -> (PathBuf, bool) {
     if let Some(p) = explicit {
         return (p.to_path_buf(), false);
     }
-    let name = default_ferry_zip_name(ecosystem, all_versions, targets, nodes, has_catalog);
+    let name = default_ferry_name(
+        ecosystem,
+        all_versions,
+        targets,
+        nodes,
+        has_catalog,
+        archive,
+    );
     (output_dir.join(name), true)
 }
 
@@ -252,5 +303,32 @@ mod tests {
     fn sanitize_drops_path_chars() {
         assert_eq!(sanitize_part("linux/x64"), "linux-x64");
         assert_eq!(sanitize_part("@scope/pkg"), "scope-pkg");
+    }
+
+    #[test]
+    fn name_without_zip_when_no_archive() {
+        let n = default_ferry_name_with_ts(
+            Ecosystem::Npm,
+            "20260818T010740123Z",
+            true,
+            &[],
+            &[],
+            false,
+            false,
+        );
+        assert_eq!(n, "ak-ferry-npm-20260818T010740123Z-av");
+        assert!(!n.ends_with(".zip"));
+    }
+
+    #[test]
+    fn append_stats_directory_name() {
+        let p = PathBuf::from("out/ak-ferry-go-20260818T010740123Z");
+        let with = append_stats(&p, 2, 8);
+        assert_eq!(
+            with.file_name().unwrap().to_str().unwrap(),
+            "ak-ferry-go-20260818T010740123Z-r2-m8"
+        );
+        let again = append_stats(&with, 9, 9);
+        assert_eq!(again, with);
     }
 }

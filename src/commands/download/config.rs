@@ -63,6 +63,13 @@ pub struct DownloadConfigFile {
     /// Forward-compat bag for ecosystem-specific knobs (also allowed per-job).
     #[serde(default)]
     pub options: toml::Table,
+
+    /// When `false`, write an unpacked directory instead of a zip.
+    pub archive: Option<bool>,
+
+    /// Write an unpacked directory tree instead of a zip.
+    #[serde(default)]
+    pub no_archive: bool,
 }
 
 /// A single ecosystem download job.
@@ -101,6 +108,14 @@ pub struct DownloadJob {
     /// Reserved per-ecosystem knobs
     #[serde(default)]
     pub options: toml::Table,
+
+    /// When `false`, write an unpacked directory instead of a zip.
+    /// Alternative: `no_archive = true`.
+    pub archive: Option<bool>,
+
+    /// Write an unpacked directory tree instead of a zip.
+    #[serde(default)]
+    pub no_archive: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +133,8 @@ pub struct ResolvedJob {
     pub sumdb: Option<String>,
     pub registry: Option<String>,
     pub options: toml::Table,
+    /// Write a directory tree instead of a zip.
+    pub no_archive: bool,
 }
 
 /// Upstream mirrors / registries for one download job.
@@ -249,6 +266,8 @@ impl DownloadConfigFile {
                 sumdb: self.sumdb.clone(),
                 registry: self.registry.clone(),
                 options: self.options.clone(),
+                archive: self.archive,
+                no_archive: self.no_archive,
             }]
         } else {
             return Err(AkError::ConfigError(format!(
@@ -275,6 +294,7 @@ impl DownloadConfigFile {
                 sumdb: job.sumdb,
                 registry: job.registry,
                 options: job.options,
+                no_archive: job.no_archive || job.archive == Some(false),
             });
         }
         Ok(out)
@@ -396,5 +416,30 @@ input = "mods.txt"
         let jobs = cfg.resolve_jobs(&cfg_path).unwrap();
         assert!(jobs[0].output.is_none());
         assert_eq!(jobs[0].output_dir, tmp.path());
+    }
+
+    #[test]
+    fn parse_no_archive_aliases() {
+        let text = r#"
+ecosystem = "npm"
+input = "pkgs.txt"
+no_archive = true
+"#;
+        let cfg: DownloadConfigFile = toml::from_str(text).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_path = tmp.path().join("download.config");
+        std::fs::write(&cfg_path, text).unwrap();
+        let jobs = cfg.resolve_jobs(&cfg_path).unwrap();
+        assert!(jobs[0].no_archive);
+
+        let text = r#"
+ecosystem = "pypi"
+input = "reqs.txt"
+archive = false
+"#;
+        let cfg: DownloadConfigFile = toml::from_str(text).unwrap();
+        std::fs::write(&cfg_path, text).unwrap();
+        let jobs = cfg.resolve_jobs(&cfg_path).unwrap();
+        assert!(jobs[0].no_archive);
     }
 }

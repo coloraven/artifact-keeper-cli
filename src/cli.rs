@@ -907,6 +907,55 @@ mod tests {
             Command::Download { args } => {
                 assert!(args.ecosystem.cargo);
                 assert_eq!(args.output, Some(std::path::PathBuf::from("c.zip")));
+                assert!(!args.no_archive);
+                assert!(!args.verbose);
+            }
+            _ => panic!("Expected Download"),
+        }
+    }
+
+    #[test]
+    fn parse_download_no_archive() {
+        let cli = parse(&[
+            "ak",
+            "download",
+            "--npm",
+            "package.json",
+            "--no-archive",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Download { args } => {
+                assert!(args.no_archive);
+                assert!(!args.verbose);
+            }
+            _ => panic!("Expected Download"),
+        }
+    }
+
+    #[test]
+    fn parse_download_verbose() {
+        let cli = parse(&["ak", "download", "--go", "go.mod", "-v"]).unwrap();
+        match cli.command {
+            Command::Download { args } => {
+                assert!(args.verbose);
+                assert!(!args.no_archive);
+            }
+            _ => panic!("Expected Download"),
+        }
+        let cli = parse(&[
+            "ak",
+            "download",
+            "--pypi",
+            "requirements.txt",
+            "--verbose",
+            "--no-archive",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Download { args } => {
+                assert!(args.verbose);
+                assert!(args.no_archive);
             }
             _ => panic!("Expected Download"),
         }

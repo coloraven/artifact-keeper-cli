@@ -1,18 +1,19 @@
 //! Shared ferry download engine: list → (optional expand) → concurrent toolchain
-//! fetch per root → soft-fail → manifest → zip → cleanup → error summary.
+//! fetch per root → soft-fail → manifest → zip or directory copy → cleanup → error summary.
 //!
 //! Language-specific code implements [`LanguageToolchain`]; orchestration lives here
 //! so npm / go / pypi / cargo share the same control flow.
 //!
 //! Toolchain downloads stay under the job work directory (never the user’s global
-//! `~/go`, `~/.npm`, `~/.cargo`, pip cache, …). After the ferry zip is written,
-//! that work tree is deleted.
+//! `~/go`, `~/.npm`, `~/.cargo`, pip cache, …). After the ferry output is written,
+//! that work tree is deleted (the `--no-archive` output directory is never deleted).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+use indicatif::{ProgressBar, ProgressStyle};
 use miette::Result;
 
 use super::cache::DownloadCache;
@@ -20,10 +21,46 @@ use super::catalog::ServerCatalog;
 use super::config::UpstreamConfig;
 use super::errors::{print_error_summary, UnitError};
 use super::manifest::{file_entry, FerryManifest, ModuleEntry, RootSpec};
-use super::pack::zip_dir;
+use super::pack::{copy_dir_tree, zip_dir};
 use super::parallel;
 use crate::error::AkError;
 use crate::output::OutputFormat;
+
+/// How ferry download logs to stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogMode {
+    /// Per-package `eprintln` (CLI `--verbose`).
+    Verbose,
+    /// Progress bar over root passes; suppress per-line detail.
+    Progress,
+    /// `--format quiet` / `--quiet`: only the final path on stdout.
+    Quiet,
+}
+
+impl LogMode {
+    pub fn resolve(format: &OutputFormat, verbose: bool) -> Self {
+        if matches!(format, OutputFormat::Quiet) {
+            Self::Quiet
+        } else if verbose {
+            Self::Verbose
+        } else {
+            Self::Progress
+        }
+    }
+
+    pub fn detail(self) -> bool {
+        matches!(self, Self::Verbose)
+    }
+
+    pub fn progress_bar(self) -> bool {
+        matches!(self, Self::Progress)
+    }
+
+    /// `true` when `fetch_one` should suppress per-line detail.
+    pub fn quiet_workers(self) -> bool {
+        !self.detail()
+    }
+}
 
 /// Shared paths for one ferry job.
 #[derive(Debug, Clone)]
@@ -73,21 +110,42 @@ pub fn apply_isolated_temp(cmd: &mut Command, work: &Path) {
     cmd.env("TEMP", &tmp);
 }
 
-/// Remove the job work directory after the ferry zip is safely on disk.
-pub fn cleanup_job_work(work: &Path, format: &OutputFormat) {
+/// Remove the job work directory after the ferry output is safely on disk.
+/// Never deletes `preserve` (the `--no-archive` output dir) even if it lives
+/// under `work`.
+pub fn cleanup_job_work(work: &Path, log: LogMode, preserve: Option<&Path>) {
     if !work.exists() {
         return;
     }
-    if !matches!(*format, OutputFormat::Quiet) {
+    if let Some(keep) = preserve {
+        if path_is_within(keep, work) {
+            if log.detail() {
+                eprintln!(
+                    "Leaving work dir {} (contains output {})",
+                    work.display(),
+                    keep.display()
+                );
+            }
+            return;
+        }
+    }
+    if log.detail() {
         eprintln!("Cleaning download work dir {}…", work.display());
     }
     if let Err(e) = std::fs::remove_dir_all(work) {
-        if !matches!(*format, OutputFormat::Quiet) {
+        if log.detail() {
             eprintln!(
                 "warning: failed to remove work dir {}: {e}",
                 work.display()
             );
         }
+    }
+}
+
+fn path_is_within(inner: &Path, outer: &Path) -> bool {
+    match (inner.canonicalize(), outer.canonicalize()) {
+        (Ok(i), Ok(o)) => i == o || i.starts_with(&o),
+        _ => inner == outer || inner.starts_with(outer),
     }
 }
 
@@ -118,8 +176,12 @@ pub struct FerryOpts {
     pub catalog: Option<Arc<ServerCatalog>>,
     pub jobs: usize,
     pub format: OutputFormat,
-    /// When true, append `-r{n}-m{m}` to the zip filename after packing.
+    /// When true, append `-r{n}-m{m}` to the auto-generated name after packing.
     pub auto_name: bool,
+    /// Write a directory tree instead of a zip.
+    pub no_archive: bool,
+    /// Per-package stderr detail instead of a progress bar.
+    pub verbose: bool,
 }
 
 /// One scheduled fetch unit (usually one root; npm may expand to root×target×node).
@@ -227,24 +289,31 @@ pub async fn run_ferry(
     // expansion and fetches never touch the user’s global caches.
     let dirs = WorkDirs::create(work, tool.artifact_subdir(), tool.tool_cache_subdir())?;
 
+    let log = LogMode::resolve(&opts.format, opts.verbose);
+    let detail_format = if log.detail() {
+        opts.format.clone()
+    } else {
+        OutputFormat::Quiet
+    };
+
     if opts.all_versions {
-        if !matches!(opts.format, OutputFormat::Quiet) {
+        if !matches!(log, LogMode::Quiet) {
             eprintln!(
                 "Expanding {} root(s) to all published versions ({})…",
                 roots.len(),
                 tool.ecosystem()
             );
         }
-        roots = tool.expand_all_versions(roots, &opts.upstream, &opts.format, work)?;
+        roots = tool.expand_all_versions(roots, &opts.upstream, &detail_format, work)?;
         if roots.is_empty() {
-            cleanup_job_work(work, &opts.format);
+            cleanup_job_work(work, log, None);
             return Err(AkError::ConfigError(format!(
                 "No published versions found for listed {} packages/modules",
                 tool.ecosystem()
             ))
             .into());
         }
-        if !matches!(opts.format, OutputFormat::Quiet) {
+        if !matches!(log, LogMode::Quiet) {
             eprintln!(
                 "Will fetch {} {} version(s)",
                 roots.len(),
@@ -263,6 +332,19 @@ pub async fn run_ferry(
     let mut unit_errors: Vec<UnitError> = Vec::new();
 
     let passes = tool.expand_passes(roots.clone());
+    let progress = if log.progress_bar() && !passes.is_empty() {
+        let pb = ProgressBar::new(passes.len() as u64);
+        pb.set_style(
+            ProgressStyle::with_template("{msg} [{bar:40.cyan/blue}] {pos}/{len}")
+                .unwrap()
+                .progress_chars("##-"),
+        );
+        pb.set_message(format!("{} fetch", tool.ecosystem()));
+        Some(pb)
+    } else {
+        None
+    };
+
     let mut pending: Vec<RootPass> = Vec::new();
     let force = opts.cache.force();
     for pass in passes {
@@ -271,11 +353,15 @@ pub async fn run_ferry(
             if let Some(cat) = &opts.catalog {
                 if let Some(ver) = pass.root.version.as_deref().filter(|v| !v.is_empty()) {
                     if cat.should_skip(force, tool.ecosystem(), &pass.root.name, ver) {
-                        if !matches!(opts.format, OutputFormat::Quiet) {
+                        if log.detail() {
                             eprintln!(
                                 "[{}/{}] skip (server catalog) {}@{ver}",
                                 pass.pass_idx, pass.total, pass.root.name
                             );
+                        }
+                        if let Some(pb) = &progress {
+                            pb.set_message(format!("skip {}@{ver}", pass.root.name));
+                            pb.inc(1);
                         }
                         continue;
                     }
@@ -289,11 +375,20 @@ pub async fn run_ferry(
             &opts.cache,
             &mut known,
             &mut manifest,
-            &opts.format,
+            &detail_format,
         ) {
-            Ok(true) => continue,
+            Ok(true) => {
+                if let Some(pb) = &progress {
+                    pb.set_message(format!("cached {}", format_root(&pass.root)));
+                    pb.inc(1);
+                }
+                continue;
+            }
             Ok(false) => pending.push(pass),
             Err(e) => {
+                if let Some(pb) = &progress {
+                    pb.inc(1);
+                }
                 unit_errors.push(UnitError::new(
                     format!("restore cached {}", format_root(&pass.root)),
                     e.to_string(),
@@ -302,7 +397,7 @@ pub async fn run_ferry(
         }
     }
 
-    if !matches!(opts.format, OutputFormat::Quiet) && !pending.is_empty() {
+    if log.detail() && !pending.is_empty() {
         eprintln!(
             "Running {} {} fetch(es) with up to {} concurrent worker(s)",
             pending.len(),
@@ -311,31 +406,43 @@ pub async fn run_ferry(
         );
     }
 
-    let quiet = matches!(opts.format, OutputFormat::Quiet);
+    let quiet = log.quiet_workers();
     let dirs_c = dirs.clone();
     let upstream = opts.upstream.clone();
     let cache = Arc::clone(&opts.cache);
     let tool_c = Arc::clone(&tool);
+    let progress_w = progress.clone();
 
     let (outcomes, fetch_errs) =
         parallel::run_blocking_jobs_soft(opts.jobs, pending, move |pass| {
-            tool_c.fetch_one(
+            if let Some(pb) = &progress_w {
+                pb.set_message(format_root(&pass.root));
+            }
+            let result = tool_c.fetch_one(
                 pass,
                 dirs_c.clone(),
                 upstream.clone(),
                 Arc::clone(&cache),
                 quiet,
-            )
+            );
+            if let Some(pb) = &progress_w {
+                pb.inc(1);
+            }
+            result
         })
         .await?;
     unit_errors.extend(fetch_errs);
+
+    if let Some(pb) = &progress {
+        pb.finish_and_clear();
+    }
 
     for outcome in outcomes {
         unit_errors.extend(outcome.soft_errors);
         for m in outcome.modules {
             if let Some(cat) = &opts.catalog {
                 if cat.should_skip(force, tool.ecosystem(), &m.name, &m.version) {
-                    if !matches!(opts.format, OutputFormat::Quiet) {
+                    if log.detail() {
                         eprintln!(
                             "  skip (server catalog) {}@{}",
                             m.name, m.version
@@ -382,7 +489,7 @@ pub async fn run_ferry(
         }
     }
 
-    if let Err(e) = tool.after_all_fetches(&dirs, &mut manifest, &opts.format) {
+    if let Err(e) = tool.after_all_fetches(&dirs, &mut manifest, &detail_format) {
         unit_errors.push(UnitError::new(
             format!("{} post-process", tool.ecosystem()),
             e.to_string(),
@@ -398,12 +505,13 @@ pub async fn run_ferry(
         roots.len(),
         manifest.modules.len(),
         &unit_errors,
-        &opts.format,
+        log,
         opts.auto_name,
+        opts.no_archive,
     )
 }
 
-/// Zip payload, delete the job work tree, then report soft failures.
+/// Zip or copy payload, delete the job work tree, then report soft failures.
 pub fn finish_ferry(
     ecosystem: &str,
     push_repo_hint: &str,
@@ -413,8 +521,9 @@ pub fn finish_ferry(
     roots_len: usize,
     modules_len: usize,
     unit_errors: &[UnitError],
-    format: &OutputFormat,
+    log: LogMode,
     auto_name: bool,
+    no_archive: bool,
 ) -> Result<()> {
     let final_output = if auto_name {
         super::naming::append_stats(output, roots_len, modules_len)
@@ -422,20 +531,47 @@ pub fn finish_ferry(
         output.to_path_buf()
     };
 
-    if !matches!(*format, OutputFormat::Quiet) {
+    if log.detail() {
+        if no_archive {
+            eprintln!(
+                "Copying {} {} version(s) -> {}",
+                modules_len,
+                ecosystem,
+                final_output.display()
+            );
+        } else {
+            eprintln!(
+                "Packing {} {} version(s) -> {}",
+                modules_len,
+                ecosystem,
+                final_output.display()
+            );
+        }
+    }
+    if no_archive {
+        copy_dir_tree(payload, &final_output)?;
+    } else {
+        zip_dir(payload, &final_output)?;
+    }
+    // Output is on disk — drop payload + toolchain caches so the host env stays clean.
+    // Never delete the --no-archive output directory.
+    let preserve = if no_archive {
+        Some(final_output.as_path())
+    } else {
+        None
+    };
+    cleanup_job_work(work, log, preserve);
+
+    if matches!(log, LogMode::Quiet) {
+        println!("{}", final_output.display());
+    } else if no_archive {
         eprintln!(
-            "Packing {} {} version(s) -> {}",
+            "Wrote {} ({} roots, {} packages). Upload with:\n  ak artifact push <{push_repo_hint}-local> --from-dir {} --skip-dupe-uploads",
+            final_output.display(),
+            roots_len,
             modules_len,
-            ecosystem,
             final_output.display()
         );
-    }
-    zip_dir(payload, &final_output)?;
-    // Zip is on disk — drop payload + toolchain caches so the host env stays clean.
-    cleanup_job_work(work, format);
-
-    if matches!(*format, OutputFormat::Quiet) {
-        println!("{}", final_output.display());
     } else {
         eprintln!(
             "Wrote {} ({} roots, {} packages). Upload with:\n  ak artifact push <{push_repo_hint}-repo> --from-archive {}",
@@ -448,7 +584,7 @@ pub fn finish_ferry(
 
     if print_error_summary(ecosystem, unit_errors) {
         return Err(AkError::ConfigError(format!(
-            "{} {ecosystem} unit(s) failed (details above); successful packages are in the ferry zip",
+            "{} {ecosystem} unit(s) failed (details above); successful packages are in the ferry output",
             unit_errors.len()
         ))
         .into());

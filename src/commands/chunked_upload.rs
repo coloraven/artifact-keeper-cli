@@ -358,7 +358,9 @@ pub async fn chunked_upload(
 
     pb.finish_with_message(format!("Uploaded {file_name}"));
 
-    // Step 5: Finalize
+    // Step 5: Finalize (server assembles chunks + creates the artifact; can take
+    // a while for large files with no further progress updates).
+    eprintln!("Finalizing upload (server assembling chunks)...");
     let result = finalize_upload(&http, base_url, auth_header, &session_id).await?;
 
     // Step 6: Clean up cache

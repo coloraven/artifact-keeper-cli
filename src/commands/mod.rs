@@ -14,6 +14,7 @@ pub mod doctor;
 pub mod download;
 pub mod dt;
 pub mod email_subscriptions;
+pub mod ferry_dir;
 pub mod go_proxy;
 pub mod group;
 pub mod helpers;

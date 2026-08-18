@@ -103,6 +103,8 @@ pub async fn download_npm(
     jobs: usize,
     format: &OutputFormat,
     auto_name: bool,
+    no_archive: bool,
+    verbose: bool,
 ) -> Result<()> {
     if all_versions {
         if (!targets.is_empty() || !nodes.is_empty()) && !matches!(format, OutputFormat::Quiet) {
@@ -148,6 +150,8 @@ pub async fn download_npm(
             jobs,
             format: format.clone(),
             auto_name,
+            no_archive,
+            verbose,
         },
     )
     .await

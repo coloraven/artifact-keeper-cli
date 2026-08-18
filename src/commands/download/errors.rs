@@ -31,7 +31,7 @@ pub fn print_error_summary(ecosystem: &str, errors: &[UnitError]) -> bool {
         return false;
     }
     eprintln!(
-        "=== {} download: {} failure(s) (skipped; ferry zip still written if anything succeeded) ===",
+        "=== {} download: {} failure(s) (skipped; ferry output still written if anything succeeded) ===",
         ecosystem,
         errors.len()
     );
